@@ -1,0 +1,21 @@
+# Private inputs, configuration and all generated material stay local.
+/.private/
+/.venv/
+/.cache/
+/.pytest_cache/
+/.ruff_cache/
+/build/
+/dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.coverage*
+htmlcov/
+.env
+.env.*
+*.pdf
+*.png
+*.jpg
+*.sqlite*
+*.db
+*.log

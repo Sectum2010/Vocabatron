@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "lesson": 1,
+  "source": "sources/vocabulary.pdf",
+  "template": "sources/template.pdf",
+  "prefixes": ["VersionA", "VersionB"],
+  "expected_words": null,
+  "solver": {"workers": 4, "seed": 37, "seconds_per_layout": 240}
+}

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vocabatron"
+version = "0.1.0"
+description = "Local, source-faithful crossword generation and independent PDF verification"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "ortools>=9.12,<10",
+  "pdfplumber>=0.11,<0.12",
+  "pypdf>=6,<7",
+  "reportlab>=4.4,<5",
+  "pydantic>=2.11,<3",
+  "pypdfium2>=4.30,<6",
+  "Pillow>=11,<13",
+]
+
+[project.scripts]
+vocabatron = "vocabatron.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "build>=1.2,<2"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vocabatron"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/tests", "/docs", "/AGENTS.md", "/README.md", "/pyproject.toml", "/uv.lock", "/config.example.json", "/.gitignore"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --basetemp=.cache/pytest"
+markers = ["private: explicitly enabled real local integration"]
