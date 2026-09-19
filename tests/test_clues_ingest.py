@@ -36,7 +36,7 @@ def test_bounded_model_failure_modes(tmp_path,mode):
         if mode=="wrong_candidate":choices[0]["candidate_id"]=choices[1]["candidate_id"]
         if mode=="extra":choices.append({"word_id":"extra","candidate_id":"extra"})
         if mode=="extra_text":choices[0]["text"]="model invented text"
-        return {"done":True,"done_reason":"length" if mode=="truncated" else "stop","message":{"content":"{" if mode=="invalid_json" else json.dumps({"choices":choices})}}
+        return {"model":MODEL,"done":True,"done_reason":"length" if mode=="truncated" else "stop","message":{"content":"{" if mode=="invalid_json" else json.dumps({"choices":choices})}}
     with pytest.raises(Problem,match="MODEL_SELECTION_INVALID"):select(lesson,Ollama(transport),store,retries=1)
     assert len(calls)==2
     assert all(c["model"]==MODEL and isinstance(c["format"],dict) and "tools" not in c for c in calls)
@@ -73,7 +73,7 @@ def test_full_text_layer_import_with_independent_extractor(tmp_path):
     assert report["status"]=="VERIFIED" and len(lesson.words)==2
     assert all(w.forms and w.pronunciation and w.definition and w.examples for w in lesson.words)
     assert lesson.words[0].candidates[0].text=="made up phrase"
-    assert store.path("ingest/transcript.md").read_text().count("synthetic example")==2
+    assert store.path(__import__("pathlib").Path(store.read("current.json")["lesson_path"]).with_name("transcript.md")).read_text().count("synthetic example")==2
     with pytest.raises(Problem,match="LESSON_REQUIRES_DECISION"):ingest(source,4,store)
 
 
@@ -82,9 +82,13 @@ def test_second_extractor_disagreement_is_not_called_verified(tmp_path,monkeypat
     source=tmp_path/"synthetic.pdf";synthetic_handout(source);store=PrivateStore(tmp_path/"private")
     real=subprocess.run
     def altered(*args,**kwargs):
-        r=real(*args,**kwargs);r.stdout=r.stdout.replace(b"invented",b"omitted",1);return r
+        r=real(*args,**kwargs)
+        from pathlib import Path
+        target=Path(args[0][-1]);target.write_bytes(target.read_bytes().replace(b"invented",b"omitted",1))
+        return r
     monkeypatch.setattr(subprocess,"run",altered)
-    with pytest.raises(Problem,match="TRANSCRIPTION_REQUIRES_DECISION"):ingest(source,3,store)
+    from vocabatron.ingest import extract_local
+    with pytest.raises(Problem,match="TRANSCRIPTION_REQUIRES_DECISION"):extract_local(source,3)
 
 
 def test_explicit_benchmark_preserves_formal_frozen_version(tmp_path,monkeypatch):
@@ -105,7 +109,7 @@ def test_explicit_benchmark_preserves_formal_frozen_version(tmp_path,monkeypatch
         state["loaded"]=True
         words=json.loads(payload["messages"][1]["content"])["untrusted_source_data"]
         choices=[{"word_id":w["word_id"],"candidate_id":w["candidates"][0]["candidate_id"]} for w in words]
-        return {"done":True,"done_reason":"stop","eval_count":12,"message":{"content":json.dumps({"choices":choices})}}
+        return {"model":MODEL,"done":True,"done_reason":"stop","eval_count":12,"message":{"content":json.dumps({"choices":choices})}}
     monkeypatch.setattr(services,"Ollama",lambda:Ollama(transport))
     result=services.benchmark_model(store,1)
     assert result["measurements"][1]["already_loaded"] is True

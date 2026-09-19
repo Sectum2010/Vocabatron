@@ -585,9 +585,10 @@ wheels = [
 
 [[package]]
 name = "vocabatron"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
+    { name = "numpy" },
     { name = "ortools" },
     { name = "pdfplumber" },
     { name = "pillow" },
@@ -605,6 +606,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "numpy", specifier = ">=2,<3" },
     { name = "ortools", specifier = ">=9.12,<10" },
     { name = "pdfplumber", specifier = ">=0.11,<0.12" },
     { name = "pillow", specifier = ">=11,<13" },

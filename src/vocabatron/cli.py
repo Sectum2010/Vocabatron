@@ -14,7 +14,7 @@ from .storage import PrivateStore, identifier
 from . import services
 
 
-EXIT_CODES={"BUSY":5,"CANCELLED":130,"UNKNOWN":6,"INFEASIBLE":7,"MODEL_INVALID":8}
+EXIT_CODES={"BUSY":5,"CANCELLED":130,"UNKNOWN":6,"INFEASIBLE":7,"MODEL_INVALID":8,"RESOURCE_LIMIT":9,"WORKER_FAILED":10,"PUBLISH_FAILED":11}
 
 
 def main(argv=None):
@@ -36,12 +36,12 @@ def main(argv=None):
             from .privacy import scan
             result=scan(args.project,args.packages)
         else:
+            private_root=Path(__file__).resolve().parents[2]/".private"
+            if not args.private_dir.absolute().is_relative_to(private_root):raise Problem("UNSAFE_PATH","CLI 私有目录必须位于当前项目 .private 内")
             store=PrivateStore(args.private_dir)
             if args.command=="ingest":result=services.import_lesson(store)
             elif args.command=="check-transcript":
-                cfg=services.configuration(store);lesson=Lesson.model_validate(store.read("ingest/lesson.json"))
-                with store.exclusive():report=check_transcription(store.path(cfg.source),lesson,store)
-                result={"status":report["status"],"words":len(lesson.words)}
+                result=services.check_lesson(store)
             elif args.command=="select":result=services.select_clues(store,new_version=args.new_version)
             elif args.command=="generate":
                 cfg=services.configuration(store);values=cfg.solver.model_dump()
@@ -54,9 +54,10 @@ def main(argv=None):
             elif args.command=="private-test":result=services.private_acceptance(store,args.task_id)
             elif args.command=="status":result=services.task_status(store,args.task_id)
             elif args.command=="cancel":
-                store.write(Path("tasks")/identifier(args.task_id)/"cancel.request",b"cancel\n");result={"status":"CANCEL_REQUESTED"}
+                result=services.cancel_attempt(store,args.task_id)
             elif args.command=="metrics":
-                result=store.read("model/metrics.json")
+                _,lesson,frozen=services.load_inputs(store)
+                result=services.verify_evidence(store,lesson,frozen)
             elif args.command=="benchmark-model":result=services.benchmark_model(store,args.sample_words)
         print(json.dumps(result,ensure_ascii=False,indent=2));return 0
     except Problem as e:

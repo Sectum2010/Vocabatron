@@ -11,6 +11,7 @@ from ortools.sat.python import cp_model
 
 from .domain import Layout, Placement, Problem, SolverOptions, check_input
 from .validation import validate_layout, validate_pair
+from .execution import checkpoint, CURRENT
 
 
 def static_graph(lesson):
@@ -64,6 +65,7 @@ def warm_hint(lesson,size,seed,seconds=8,exclude=None):
     best=[]
     def visit(placed,remaining):
         nonlocal best
+        checkpoint()
         if len(placed)>len(best):best=placed[:]
         if time.perf_counter()>attempt_deadline:return None
         if not remaining:
@@ -87,7 +89,7 @@ def warm_hint(lesson,size,seed,seconds=8,exclude=None):
                         else:
                             proposals.add((p.row+i,p.col-j,"across"))
             valid=[]
-            for r,c,d in proposals:
+            for r,c,d in sorted(proposals):
                 p=Placement(word_id=wid,row=r,col=c,direction=d)
                 if _hint_legal(placed,p,words,size):valid.append(p)
             if valid:options.append((wid,valid))
@@ -110,11 +112,15 @@ def warm_hint(lesson,size,seed,seconds=8,exclude=None):
         attempt_deadline=min(start+seconds,time.perf_counter()+seconds/4)
         found=visit([first],set(words)-{root.word_id})
         if found or time.perf_counter()>=start+seconds:break
-    return found,{"seconds":time.perf_counter()-start,"most_words_placed":len(best),"bounded_restarts":attempts}
+    # A locally valid partial assignment is useful to CP-SAT too. It is never
+    # published or treated as a solution; all original constraints remain active.
+    partial=Layout(lesson_version=lesson.version,placements=tuple(best),size=size) if best else None
+    return found or partial,{"seconds":time.perf_counter()-start,"most_words_placed":len(best),
+                            "bounded_restarts":attempts,"hint_complete":found is not None}
 
 
 class ExactModel:
-    def __init__(self,lesson,size=20,clue_costs=None,capacities=None):
+    def __init__(self,lesson,size=20,clue_costs=None,capacities=None,budget_check=None):
         check_input(lesson,size);static_graph(lesson)
         started=time.perf_counter()
         self.lesson,self.size=lesson,size
@@ -123,6 +129,8 @@ class ExactModel:
         self.placements={};self.positions={};self.crossings={};self.edges={}
         self.lookup={}
         for wi,word in enumerate(lesson.words):
+            checkpoint()
+            if budget_check:budget_check()
             ps=[]
             for d in (0,1):
                 for r in range(size if not d else size-len(word.letters)+1):
@@ -161,6 +169,8 @@ class ExactModel:
                     # Both occupied endpoints require a registered answer across this edge.
                     m.add(occupied[r,c]+occupied[nxt]-1<=sum(by_edge[r,c,d]))
         for i,a in enumerate(lesson.words):
+            checkpoint()
+            if budget_check:budget_check()
             ra,ca,da=self.positions[a.word_id]
             for b in lesson.words[i+1:]:
                 matches=[(ia,ib) for ia,ch in enumerate(a.letters) for ib,c in enumerate(b.letters) if c==ch]
@@ -200,7 +210,13 @@ class ExactModel:
         self.model.clear_hints()
         if layout is None:return
         chosen={(p.word_id,p.row,p.col,int(p.direction=="down")) for p in layout.placements}
-        for key,x in self.lookup.items():self.model.add_hint(x,int(key in chosen))
+        supplied={p.word_id for p in layout.placements}
+        for key,x in self.lookup.items():
+            if key[0] in supplied:self.model.add_hint(x,int(key in chosen))
+
+    def exclude_layout(self,layout):
+        variables=[self.lookup[p.word_id,p.row,p.col,int(p.direction=="down")] for p in layout.placements]
+        self.model.add(sum(variables)<=len(variables)-1)
 
     def exclude_fingerprint(self,crossings):
         present=set(crossings)
@@ -233,18 +249,25 @@ class ExactModel:
                             self.model.add(sum(variables)<=len(variables)-1)
 
     def solve(self,options: SolverOptions,cancel=None):
+        checkpoint()
+        if cancel and cancel():raise Problem("CANCELLED","精确求解已取消")
         solver=cp_model.CpSolver();solver.parameters.num_search_workers=options.workers
         solver.parameters.random_seed=options.seed;solver.parameters.max_time_in_seconds=options.seconds_per_layout
+        solver.parameters.repair_hint=True
         completed=threading.Event()
+        context=CURRENT.get()
         def watch():
             while not completed.wait(.25):
-                if cancel and cancel():solver.stop_search();return
-        if cancel:threading.Thread(target=watch,daemon=True).start()
+                if (cancel and cancel()) or (context and (context.budget_exhausted() or context.heartbeat_error)):solver.stop_search();return
+        if cancel or context:threading.Thread(target=watch,daemon=True).start()
         start=time.perf_counter()
         try:status=solver.solve(self.model)
         finally:completed.set()
+        checkpoint()
+        if cancel and cancel():raise Problem("CANCELLED","精确求解已取消")
         name=solver.status_name(status)
         metrics={"status":name,"seconds":time.perf_counter()-start,"workers":options.workers,
+                 "hint_repair":True,
                  "seed":options.seed,"branches":solver.num_branches,"conflicts":solver.num_conflicts,
                  "peak_rss_kib":resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}
         if status not in (cp_model.FEASIBLE,cp_model.OPTIMAL):
@@ -255,20 +278,35 @@ class ExactModel:
         return layout,metrics
 
 
-def solve_pair(lesson,options=SolverOptions(),*,size=20,clue_costs=None,capacities=None,progress=None,cancel=None,saved_first=None):
+def solve_pair(lesson,options=SolverOptions(),*,size=20,clue_costs=None,capacities=None,progress=None,cancel=None,saved_first=None,typography=None):
     emit=progress or (lambda stage,value:None)
     emit("MODELING",{})
     model=ExactModel(lesson,size,clue_costs,capacities)
     metrics={"model":model.metrics,"optimization":{"status":"NOT_RUN","reason":"feasibility first"}}
     first=saved_first
     if first is None:
+        emit("HINTING_FIRST",{})
         hint,hm=warm_hint(lesson,size,options.seed);metrics["first_hint"]=hm;model.hint(hint)
         emit("SOLVING_FIRST",metrics)
-        first,metrics["first"]=model.solve(options,cancel)
+        deadline=time.perf_counter()+options.seconds_per_layout
+        rejected=0
+        while True:
+            checkpoint()
+            remaining=deadline-time.perf_counter()
+            if remaining<=0:raise Problem("UNKNOWN","第一份布局排版搜索预算耗尽")
+            first,metrics["first"]=model.solve(options.model_copy(update={"seconds_per_layout":remaining}),cancel)
+            try:
+                if typography:typography(first)
+                break
+            except Problem as exc:
+                if exc.code not in {"CLUE_OVERFLOW","CLUE_TOO_WIDE"}:raise
+                model.exclude_layout(first);rejected+=1;model.hint(None)
+        metrics["first_typography_rejected"]=rejected
         emit("FIRST_VERIFIED",first.model_dump(mode="json"))
     else:
         validate_layout(lesson,first);metrics["first"]={"status":"RESUMED_VERIFIED"}
     model.exclude_fingerprint(validate_layout(lesson,first)["crossings"])
+    emit("HINTING_SECOND",{})
     hint,hm=warm_hint(lesson,size,options.seed+1,exclude=first);metrics["second_hint"]=hm;model.hint(hint)
     emit("SOLVING_SECOND",metrics)
     deadline=time.perf_counter()+options.seconds_per_layout;rejected=0
@@ -276,10 +314,15 @@ def solve_pair(lesson,options=SolverOptions(),*,size=20,clue_costs=None,capaciti
         remaining=deadline-time.perf_counter()
         if remaining<=0:raise Problem("UNKNOWN","第二份预算耗尽，未标记双份完成",details=metrics)
         second,sm=model.solve(options.model_copy(update={"seconds_per_layout":remaining}),cancel)
-        try:pair=validate_pair(lesson,first,second);break
+        try:
+            pair=validate_pair(lesson,first,second)
+            if typography:typography(second)
+            break
         except Problem as e:
-            if e.code!="GEOMETRIC_COPY":raise
-            model.exclude_geometry(second);rejected+=1;model.hint(None)
+            if e.code=="GEOMETRIC_COPY":model.exclude_geometry(second)
+            elif e.code in {"CLUE_OVERFLOW","CLUE_TOO_WIDE"}:model.exclude_layout(second)
+            else:raise
+            rejected+=1;model.hint(None)
     metrics["second"]=sm;metrics["geometric_copies_rejected"]=rejected
     emit("SECOND_VERIFIED",second.model_dump(mode="json"))
     return (first,second),metrics,pair

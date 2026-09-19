@@ -109,19 +109,28 @@ def test_atomic_whole_set_and_rebuild_without_model_solver(material,tmp_path,mon
         services.private_acceptance(store,"complete")
 
 
-def test_half_set_never_published(tmp_path,monkeypatch):
-    s=PrivateStore(tmp_path/"private");stage=s.stage("incomplete")
-    s.write(stage/"a.pdf",b"synthetic")
-    manifest={"status":"VERIFIED","pdfs":[{"name":"a.pdf","sha256":sha256(s.path(stage/"a.pdf"))},{"name":"b.pdf","sha256":"missing"}]}
-    with pytest.raises(Problem,match="INCOMPLETE_SET"):s.publish(stage,"incomplete",manifest)
+def test_half_set_never_published(tmp_path,monkeypatch,material):
+    t,o,l,a,b,f,p=material
+    s=PrivateStore(tmp_path/"private");captured={};publisher=s.publish
+    config=PrivateConfig(lesson=3,source="sources/source.pdf",template="sources/template.pdf",prefixes=("VersionA","VersionB"))
+    def capture(stage,task_id,manifest):
+        captured.update(stage=stage,manifest=manifest)
+        raise Problem("TEST_BEFORE_PUBLICATION","synthetic publication boundary")
+    with monkeypatch.context() as m:
+        m.setattr(s,"publish",capture)
+        with pytest.raises(Problem,match="TEST_BEFORE_PUBLICATION"):
+            _export_set(s,"incomplete",config,l,f,(a,b),p,t,{})
+    stage=captured["stage"];manifest=captured["manifest"]
+    second=s.path(stage/manifest["pdfs"][1]["name"]);saved=second.read_bytes();second.unlink()
+    with pytest.raises(Problem,match="INCOMPLETE_SET"):publisher(stage,"incomplete",manifest)
     assert not s.path("results/incomplete").exists()
-    s.write(stage/"b.pdf",b"synthetic second");manifest["pdfs"][1]["sha256"]=sha256(s.path(stage/"b.pdf"))
+    s.write(stage/manifest["pdfs"][1]["name"],saved)
     import os
     def crash(*args):raise OSError("simulated interruption before directory publication")
     monkeypatch.setattr(os,"rename",crash)
-    with pytest.raises(OSError):s.publish(stage,"incomplete",manifest)
+    with pytest.raises(OSError):publisher(stage,"incomplete",manifest)
     assert not s.path("results/incomplete").exists()
-    assert s.path(stage/"a.pdf").exists() and s.path(stage/"b.pdf").exists()
+    assert all(s.path(stage/item["name"]).exists() for item in manifest["pdfs"])
 
 
 def test_path_boundaries_and_private_archives(tmp_path):
@@ -143,10 +152,12 @@ def test_tracked_private_file_and_synthetic_credential_are_rejected(tmp_path,mon
     import subprocess
     from vocabatron.privacy import scan
     private=tmp_path/".private";private.mkdir();(private/"example.json").write_text("synthetic private content")
-    def git_read(command,**kwargs):
-        names=b".private/example.json\0" if "--cached" in command else b""
-        return subprocess.CompletedProcess(command,0,stdout=names)
-    monkeypatch.setattr(subprocess,"run",git_read)
-    with pytest.raises(Problem,match="PRIVACY_SCAN_FAILED"):scan(tmp_path)
+    oid="a"*40
+    def git_read(args,limit=None):
+        if "--stage" in args:return b"100644 "+oid.encode()+b" 0\t.private/example.json\0"
+        if args[:2]==["cat-file","-s"]:return b"25"
+        if args[:2]==["cat-file","blob"]:return b"synthetic private content"
+        return b""
+    with pytest.raises(Problem,match="PRIVACY_SCAN_FAILED"):scan(tmp_path,runner=git_read)
     synthetic=("ghp_"+"A"*36).encode()
     assert inspect_text("synthetic.txt",synthetic)[0]["rule"]=="github_token"

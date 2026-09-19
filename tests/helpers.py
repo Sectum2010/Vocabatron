@@ -84,3 +84,25 @@ def synthetic_handout(path: Path):
         c.drawString(325,top-54,"ANTONYM: created opposite")
         c.drawString(80,top-76,"This is a newly authored synthetic example.")
     c.showPage();c.save()
+
+
+def synthetic_course(path,answers,number=3):
+    """Invented multipage source; layout witnesses are never encoded in the PDF."""
+    c=canvas.Canvas(str(path),pagesize=(612,792),invariant=1)
+    for page_start in range(0,len(answers),7):
+        c.setFont('Helvetica',11);c.drawString(70,748,f'Invented Classroom Lesson {number} Words')
+        for index,word in enumerate(answers[page_start:page_start+7]):
+            ordinal=page_start+index+1;top=700-index*90;bottom=top-90
+            for x in (50,75,560):c.line(x,bottom,x,top)
+            for y in (top,bottom):c.line(50,y,560,y)
+            for y in (top-20,top-40,top-60):c.line(75,y,560,y)
+            c.line(205,top-20,205,top);c.line(320,top-20,320,top);c.line(320,top-60,320,top-40)
+            c.setFont('Helvetica',7)
+            c.drawString(55,top-48,str(ordinal));c.drawString(80,top-14,word+' (noun)')
+            c.drawString(210,top-14,'[invented]');c.drawString(325,top-14,'FORMS: synthetic form')
+            c.drawString(80,top-34,'An entirely invented definition.')
+            c.drawString(80,top-54,f'SYNONYM: invented clue {ordinal}, made up phrase')
+            c.drawString(325,top-54,'ANTONYM: created opposite')
+            c.drawString(80,top-76,'This is an authored synthetic example.')
+        c.showPage()
+    c.save()

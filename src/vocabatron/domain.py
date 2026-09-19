@@ -7,6 +7,7 @@ import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+from .limits import Limits
 
 
 class Problem(Exception):
@@ -16,7 +17,7 @@ class Problem(Exception):
 
 
 class Record(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
 
 def digest(value) -> str:
@@ -57,7 +58,7 @@ class Word(Record):
 
 
 class Lesson(Record):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
     lesson: int = Field(gt=0, le=9999)
     source_sha256: str
     title: tuple[Fragment, ...]
@@ -66,7 +67,13 @@ class Lesson(Record):
 
     @property
     def version(self):
-        return digest(self)
+        return digest(self) if self.schema_version == 1 else self.content_version
+
+    @property
+    def content_version(self):
+        data=self.model_dump(mode="json")
+        data.pop("coverage_sha256");data.pop("schema_version")
+        return digest(data)
 
 
 class Choice(Record):
@@ -79,7 +86,7 @@ class Selection(Record):
 
 
 class FrozenClues(Record):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
     lesson_version: str
     source_sha256: str
     choices: tuple[Choice, ...]
@@ -88,10 +95,15 @@ class FrozenClues(Record):
     ollama_version: str
     prompt_version: str
     parameters: dict
+    selection_run_id: str | None = None
+    evidence_sha256: str | None = None
 
     @property
     def version(self):
-        return digest(self)
+        data=self.model_dump(mode="json")
+        if self.schema_version == 1:
+            data.pop("selection_run_id");data.pop("evidence_sha256")
+        return digest(data)
 
 
 class Placement(Record):
@@ -110,8 +122,9 @@ class Layout(Record):
 
 class SolverOptions(Record):
     workers: int = Field(default=4, ge=1, le=8)
-    seed: int = 37
-    seconds_per_layout: float = Field(default=240, gt=0)
+    seed: int = Field(default=37,ge=0,le=2147483647)
+    seconds_per_layout: float = Field(default=240, gt=0, le=900)
+    optimization_seconds: float = Field(default=2, ge=0, le=30)
 
 
 class PrivateConfig(Record):
@@ -122,6 +135,9 @@ class PrivateConfig(Record):
     prefixes: tuple[str, str]
     expected_words: int | None = None
     solver: SolverOptions = SolverOptions()
+    resources: Limits = Limits()
+    total_seconds: float = Field(default=1800, gt=0, le=7200)
+    stage_seconds: float = Field(default=600, gt=0, le=1800)
 
 
 def check_input(lesson: Lesson, size: int = 20):

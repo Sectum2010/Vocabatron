@@ -122,3 +122,17 @@ def test_exhaustive_geometry_exclusion_does_not_overprune():
         assert (status in (cp_model.FEASIBLE,cp_model.OPTIMAL))==expected
         kept+=expected;removed+=not expected
     assert kept and removed
+
+
+def test_partial_warm_hint_does_not_assign_missing_words_false():
+    from vocabatron.solver import ExactModel
+    from .helpers import lesson_of
+    from vocabatron.domain import Layout,Placement
+    lesson=lesson_of(['AB','AC']);model=ExactModel(lesson,size=3)
+    partial=Layout(lesson_version=lesson.version,size=3,placements=(Placement(word_id=lesson.words[0].word_id,row=0,col=0,direction='across'),))
+    model.hint(partial)
+    hinted=set(model.model.proto.solution_hint.vars)
+    assert hinted
+    assert all(x.index not in hinted for x,p in model.placements[lesson.words[1].word_id])
+    layout,metrics=model.solve(SolverOptions(seconds_per_layout=5,workers=1))
+    assert len(layout.placements)==2

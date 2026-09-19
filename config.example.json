@@ -3,7 +3,17 @@
   "lesson": 1,
   "source": "sources/vocabulary.pdf",
   "template": "sources/template.pdf",
-  "prefixes": ["VersionA", "VersionB"],
+  "prefixes": [
+    "VersionA",
+    "VersionB"
+  ],
   "expected_words": null,
-  "solver": {"workers": 4, "seed": 37, "seconds_per_layout": 240}
+  "solver": {
+    "workers": 4,
+    "seed": 37,
+    "seconds_per_layout": 240,
+    "optimization_seconds": 2
+  },
+  "total_seconds": 1800,
+  "stage_seconds": 600
 }

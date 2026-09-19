@@ -38,7 +38,7 @@ def check_glyphs(text):
         raise Problem("MISSING_GLYPH","当前嵌入字体不覆盖全部原文字符；未替换原文")
 
 
-def inspect_pdf(path):
+def _inspect_pdf(path):
     reader=PdfReader(path)
     if reader.is_encrypted:raise Problem("ENCRYPTED_PDF","原件加密，不能可靠读取")
     seen=set();findings=[]
@@ -63,8 +63,8 @@ def inspect_pdf(path):
                    "policy":"new catalog, selected pages only, no attachments or document actions"}
 
 
-def calibrate(path: Path):
-    reader,security=inspect_pdf(path)
+def _calibrate(path: Path):
+    reader,security=_inspect_pdf(path)
     if len(reader.pages)<2:raise Problem("TEMPLATE_PAGE_COUNT","模板至少需要两页")
     with pdfplumber.open(path) as doc:
         first,second=doc.pages[:2]
@@ -120,13 +120,22 @@ def clue_text(number,relation,text):
 
 
 def clue_capacity(lesson,frozen,profile):
+    """Necessary lower bounds only; exact numbering/line breaking is checked after solving.
+
+    Every clue needs at least one line. The longest token gives a safe directional
+    impossibility test. Never use a pessimistic maximum-number estimate as a proof.
+    """
     choices=selected_candidates(lesson,frozen);costs={}
-    capacities=[]
-    for box in profile["columns"]:capacities.append(math.floor((box[3]-box[1]-24)*100))
+    capacities=[math.floor((box[3]-box[1]-24)*100) for box in profile["columns"]]
     for word in lesson.words:
-        c=choices[word.word_id];text=clue_text(len(lesson.words),c.relation,c.text)
-        costs[word.word_id]=[math.ceil((len(wrap(text,box[2]-box[0]-24,MIN_CLUE_SIZE))*MIN_CLUE_SIZE*1.35+5)*100)
-                             for box in profile["columns"]]
+        c=choices[word.word_id];values=[]
+        for cap,box in zip(capacities,profile["columns"]):
+            try:wrap(clue_text(1,c.relation,c.text),box[2]-box[0]-24,MIN_CLUE_SIZE)
+            except Problem as exc:
+                if exc.code!="CLUE_TOO_WIDE":raise
+                values.append(cap+1)
+            else:values.append(math.floor((MIN_CLUE_SIZE*1.35+5)*100))
+        costs[word.word_id]=values
     return costs,capacities
 
 
@@ -158,7 +167,11 @@ def plan(lesson,layout,frozen,profile):
     for direction,box in zip(("across","down"),profile["columns"]):
         entries=[r for r in rows if r["direction"]==direction]
         for size in (12.0,11.5,MIN_CLUE_SIZE):
-            wrapped=[wrap(clue_text(r["number"],r["relation"],r["text"]),box[2]-box[0]-24,size) for r in entries]
+            try:
+                wrapped=[wrap(clue_text(r["number"],r["relation"],r["text"]),box[2]-box[0]-24,size) for r in entries]
+            except Problem as exc:
+                if exc.code!="CLUE_TOO_WIDE":raise
+                continue
             height=sum(len(lines)*size*1.35+5 for lines in wrapped)
             if height<=box[3]-box[1]-24:break
         else:raise Problem("CLUE_OVERFLOW","两栏不能在可读字号下容纳全部冻结线索")
@@ -181,9 +194,9 @@ def plan(lesson,layout,frozen,profile):
     return items,rows
 
 
-def export_pdf(template,output,lesson,layout,frozen,profile):
+def _export_pdf(template,output,lesson,layout,frozen,profile):
     if sha256(template)!=profile["template_sha256"]:raise Problem("TEMPLATE_CHANGED","模板指纹与坐标配置不符")
-    reader,_=inspect_pdf(template)
+    reader,_=_inspect_pdf(template)
     items,rows=plan(lesson,layout,frozen,profile)
     writer=PdfWriter()
     for index,pmeta in enumerate(profile["pages"]):
@@ -211,90 +224,28 @@ def export_pdf(template,output,lesson,layout,frozen,profile):
     return items,rows
 
 
-def _char_key(ch):
-    return ch["text"],round(ch["x0"],3),round(ch["top"],3),round(ch["x1"],3),round(ch["bottom"],3)
+
+def inspect_pdf(path):
+    from .supervisor import run_job
+    return run_job("inspect",{"source":str(path)})
+
+
+def calibrate(path: Path):
+    from .supervisor import run_job
+    return run_job("calibrate",{"template":str(path)})
+
+
+def export_pdf(template,output,lesson,layout,frozen,profile):
+    from .supervisor import run_job
+    result=run_job("export",{"template":str(template),"output":str(output),
+        "lesson":lesson.model_dump(mode="json"),"layout":layout.model_dump(mode="json"),
+        "frozen":frozen.model_dump(mode="json"),"profile":profile})
+    return result["items"],result["rows"]
 
 
 def verify_pdf(template,output,lesson,layout,frozen,profile,*,expected_name,preview_dir=None):
-    """Read final bytes, subtract original characters, then check additions and pixels."""
-    output=Path(output)
-    if output.name!=expected_name:raise Problem("PDF_FILENAME","最终文件名与私人配置不符")
-    if sha256(template)!=profile["template_sha256"]:raise Problem("TEMPLATE_CHANGED","模板指纹不符")
-    reader,security=inspect_pdf(output)
-    if len(reader.pages)!=2:raise Problem("PDF_PAGE_COUNT","结果必须恰好两页")
-    if security["active_or_attached_keys"]:raise Problem("PDF_ACTIVE_CONTENT","最终 PDF 含非授权主动或附加对象")
-    expected,rows=plan(lesson,layout,frozen,profile)
-    all_additions=[];page_reports=[]
-    with pdfplumber.open(template) as original,pdfplumber.open(output) as final:
-        for index,(source,page) in enumerate(zip(original.pages[:2],final.pages)):
-            meta=profile["pages"][index];p=reader.pages[index]
-            if list(map(float,p.mediabox))!=meta["mediabox"] or list(map(float,p.cropbox))!=meta["cropbox"] or p.rotation!=meta["rotation"]:
-                raise Problem("PDF_PAGE_GEOMETRY","最终页面尺寸、裁剪或旋转与原件不符")
-            remaining=Counter(_char_key(c) for c in source.chars)
-            additions=[]
-            for ch in page.chars:
-                key=_char_key(ch)
-                if remaining[key]:remaining[key]-=1
-                else:additions.append(ch)
-            if any(remaining.values()):raise Problem("TEMPLATE_TEXT_CHANGED","原模板字符缺失或位置发生变化")
-            used=set()
-            for item in [e for e in expected if e["page"]==index]:
-                x0,y0,x1,y1=item["bbox"]
-                indices=[j for j,ch in enumerate(additions) if x0-.15<=(ch["x0"]+ch["x1"])/2<=x1+.15 and y0-.15<=(ch["top"]+ch["bottom"])/2<=y1+.15]
-                chars=sorted((additions[j] for j in indices),key=lambda ch:ch["x0"])
-                if "".join(ch["text"] for ch in chars)!=item["text"]:
-                    raise Problem("PDF_TEXT_MISMATCH","最终 PDF 字母、题号或线索有遗漏、重复或错误",details={"page":index+1,"kind":item["kind"]})
-                for j in indices:
-                    if j in used:raise Problem("PDF_DUPLICATE_TEXT","新增字符被重复分配")
-                    used.add(j)
-                    ch=additions[j]
-                    if ch["x0"]<x0-.15 or ch["x1"]>x1+.15 or ch["top"]<y0-.15 or ch["bottom"]>y1+.15:
-                        raise Problem("PDF_TEXT_POSITION","最终字符边界越过预定精确文字区域")
-            if used!=set(range(len(additions))):raise Problem("PDF_UNEXPECTED_TEXT","最终 PDF 含额外文字或文字错位")
-            all_additions.append(additions)
-            page_reports.append({"page":index+1,"original_characters":len(source.chars),"added_characters":len(additions),"text_status":"VERIFIED"})
-    # Pixel masks are per actual character bounding box, not whole cells/columns/pages.
-    scale=2.0;tolerance=0;padding_pixels=1
-    with pdfium.PdfDocument(str(template)) as original,pdfium.PdfDocument(str(output)) as final:
-        for index,report in enumerate(page_reports):
-            before=original[index].render(scale=scale).to_pil().convert("RGB")
-            after=final[index].render(scale=scale).to_pil().convert("RGB")
-            if before.size!=after.size:raise Problem("PDF_RENDER_GEOMETRY","渲染尺寸变化")
-            a=np.asarray(before);b=np.asarray(after)
-            difference=np.max(np.abs(a.astype(np.int16)-b.astype(np.int16)),axis=2)>tolerance
-            mask=np.zeros(difference.shape,dtype=bool)
-            textpage=final[index].get_textpage()
-            ink=[]
-            for ci in range(textpage.count_chars()):
-                text=textpage.get_text_range(ci,1)
-                if not text.strip():continue
-                left,bottom,right,top=textpage.get_charbox(ci)
-                ink.append((ci,text,(left,profile["pages"][index]["height"]-top,right,profile["pages"][index]["height"]-bottom)))
-            ink_used=set();ink_boxes=[]
-            for ch in all_additions[index]:
-                if ch["text"].isspace():continue
-                candidates=[(abs((box[0]+box[2]-ch["x0"]-ch["x1"])/2)+abs((box[1]+box[3]-ch["top"]-ch["bottom"])/2),ci,box)
-                            for ci,text,box in ink if text==ch["text"] and ci not in ink_used]
-                if not candidates:raise Problem("PDF_MISSING_INK_BOX","独立渲染器无法定位新增字符")
-                distance,ci,box=min(candidates)
-                if distance>ch["size"]*.65:raise Problem("PDF_INK_POSITION","实际字形轮廓与提取位置不符")
-                ink_used.add(ci);ink_boxes.append(box)
-                # Tight font ink bounds include overhangs (e.g. J), unlike advance widths.
-                x0=max(0,math.floor(box[0]*scale)-padding_pixels);x1=min(mask.shape[1],math.ceil(box[2]*scale)+padding_pixels)
-                y0=max(0,math.floor(box[1]*scale)-padding_pixels);y1=min(mask.shape[0],math.ceil(box[3]*scale)+padding_pixels)
-                mask[y0:y1,x0:x1]=True
-            outside=int(np.count_nonzero(difference & ~mask))
-            if outside:raise Problem("TEMPLATE_RENDER_CHANGED","精确新增字符区域之外发生像素变化",details={"page":index+1,"pixels":outside})
-            # Each non-space added character must produce visible ink at its own position.
-            for box in ink_boxes:
-                x0=max(0,math.floor(box[0]*scale));x1=min(mask.shape[1],math.ceil(box[2]*scale))
-                y0=max(0,math.floor(box[1]*scale));y1=min(mask.shape[0],math.ceil(box[3]*scale))
-                if not np.any(difference[y0:y1,x0:x1]):raise Problem("PDF_INVISIBLE_GLYPH","提取到字符但渲染未显示对应字形")
-            report.update({"render_status":"VERIFIED","changed_pixels":int(difference.sum()),"outside_character_masks":outside,
-                           "mask_fraction":float(mask.mean()),"mask_basis":"PDFium tight glyph ink boxes","scale":scale,"pixel_channel_tolerance":tolerance,"antialias_padding_pixels":padding_pixels})
-            if preview_dir:
-                Path(preview_dir).mkdir(mode=0o700,parents=True,exist_ok=True)
-                after.save(Path(preview_dir)/f"page-{index+1}.png")
-    return {"status":"VERIFIED","filename":output.name,"sha256":sha256(output),"pages":page_reports,
-            "clue_count":len(rows),"name_date":"unchanged original characters and pixels",
-            "manual_review":"NOT_PERFORMED","security":security}
+    from .supervisor import run_job
+    return run_job("verify",{"template":str(template),"output":str(output),
+        "lesson":lesson.model_dump(mode="json"),"layout":layout.model_dump(mode="json"),
+        "frozen":frozen.model_dump(mode="json"),"profile":profile,"expected_name":expected_name,
+        "preview_dir":str(preview_dir) if preview_dir else None})

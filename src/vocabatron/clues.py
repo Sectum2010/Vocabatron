@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import math
+import uuid
+from pathlib import Path
 import time
 import urllib.error
 import urllib.request
@@ -35,13 +37,20 @@ class Ollama:
         self.transport = transport
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
-    def request(self, endpoint, payload=None, timeout=240):
+    def request(self, endpoint, payload=None, timeout=480):
+        if not isinstance(timeout,(int,float)) or not math.isfinite(timeout) or not 0<timeout<=600:
+            raise Problem("INPUT_INVALID","模型请求超时预算必须为有限正数且不超过上限")
         if endpoint not in {"version", "tags", "ps", "show", "chat"}:
             raise Problem("OLLAMA_ENDPOINT_REJECTED", "未授权的模型接口")
         if endpoint in {"show","chat"} and (not isinstance(payload,dict) or payload.get("model")!=MODEL):
             raise Problem("MODEL_REJECTED", "适配器只允许指定的本机模型")
         if self.transport is not None:
             return self.transport(endpoint, payload)
+        from .supervisor import run_job, Limits
+        return run_job("ollama",{"endpoint":endpoint,"payload":payload,"timeout":timeout},
+                       limits=Limits(wall_seconds=min(timeout+10,900)))
+
+    def _request_local(self, endpoint, payload=None, timeout=480):
         request = urllib.request.Request("http://127.0.0.1:11434/api/"+endpoint,
                                          data=json.dumps(payload).encode() if payload is not None else None,
                                          headers={"Content-Type":"application/json"})
@@ -53,8 +62,10 @@ class Ollama:
                 if len(data)>16*1024*1024:
                     raise Problem("OLLAMA_RESPONSE_TOO_LARGE", "模型响应超过上限")
                 return json.loads(data)
-        except (urllib.error.URLError, OSError, ValueError):
-            raise Problem("OLLAMA_UNAVAILABLE", "本机模型接口不可用或响应无效") from None
+        except TimeoutError:
+            raise Problem("MODEL_REQUEST_TIMEOUT", "本次本机模型请求超过客户端预算；未停止共享模型") from None
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            raise Problem("OLLAMA_UNAVAILABLE", "本机模型接口不可用或响应无效",details={"error_type":type(exc).__name__}) from None
 
     def inspect(self):
         version = self.request("version")["version"]
@@ -79,8 +90,16 @@ def budget(words):
     return payload, {"temperature":0,"seed":37,"num_ctx":context,"num_predict":output,"num_thread":4}
 
 
-def select(lesson: Lesson, adapter: Ollama, store, retries=2):
+def select(lesson: Lesson, adapter: Ollama, store, retries=2, *, publish=True):
+    from .execution import checkpoint
+    from .storage import sha256
+    checkpoint()
+    if not isinstance(retries,int) or not 0<=retries<=3:raise Problem("INPUT_INVALID","模型重试次数不合法")
+    run_id=uuid.uuid4().hex;root=Path("model/runs")/run_id
     info = adapter.inspect()
+    store.immutable_json(root/"inspection.json",info)
+    store.immutable_json(root/"lesson.json",lesson)
+    adopted=[];attempt_records=[]
     groups, group = [], []
     for word in lesson.words:
         _, options = budget(group+[word])
@@ -107,30 +126,60 @@ def select(lesson: Lesson, adapter: Ollama, store, retries=2):
         failure=None
         for attempt in range(retries+1):
             started=time.perf_counter()
-            response=adapter.request("chat",{"model":MODEL,"stream":False,"think":False,"keep_alive":"5m",
+            checkpoint()
+            request={"model":MODEL,"stream":False,"think":False,"keep_alive":"5m",
                 "format":schema,"options":parameters,"messages":[{"role":"system","content":PROMPT},
-                {"role":"user","content":json.dumps({"untrusted_source_data":payload},ensure_ascii=False)}]})
-            store.json(f"model/{lesson.version}/batch-{index}-attempt-{attempt}.json",response)
+                {"role":"user","content":json.dumps({"untrusted_source_data":payload},ensure_ascii=False)}]}
+            request_name=f"batch-{index}-attempt-{attempt}-request.json"
+            response_name=f"batch-{index}-attempt-{attempt}-response.json"
+            store.immutable_json(root/request_name,request)
+            response=adapter.request("chat",request)
+            store.immutable_json(root/response_name,response)
+            checkpoint()
+            record={"batch":index,"attempt":attempt,"request":request_name,"response":response_name,
+                    "request_sha256":sha256(store.path(root/request_name)),
+                    "response_sha256":sha256(store.path(root/response_name)),
+                    "schema_sha256":digest(schema),"parameters":parameters,"prompt_sha256":digest(PROMPT),
+                    "word_ids":[w.word_id for w in words],"retry_reason":None}
+            attempt_records.append(record)
             timings.append({"batch":index,"attempt":attempt,"wall_seconds":time.perf_counter()-started,
-                **{k:response.get(k) for k in ("load_duration","total_duration","prompt_eval_duration","eval_duration","prompt_eval_count","eval_count","done_reason")}})
+                **{k:response.get(k) if isinstance(response,dict) else None for k in ("load_duration","total_duration","prompt_eval_duration","eval_duration","prompt_eval_count","eval_count","done_reason")}})
             try:
+                if not isinstance(response,dict):raise Problem("MODEL_RESPONSE_MISMATCH","模型响应格式不合法")
+                if response.get("model")!=MODEL:
+                    raise Problem("MODEL_RESPONSE_MISMATCH", "实际响应来自不同模型")
                 if not response.get("done") or response.get("done_reason") == "length":
                     raise Problem("MODEL_TRUNCATED", "模型输出未完整结束")
                 parsed=Selection.model_validate_json(response.get("message",{}).get("content",""))
                 check_choices(subset,parsed.choices)
                 all_choices.extend(parsed.choices)
+                adopted.append(response_name)
                 break
             except (ValidationError,Problem) as e:
                 failure=e
+                record["retry_reason"]=e.code if isinstance(e,Problem) else "SCHEMA_INVALID"
+            finally:
+                store.immutable_json(root/f"batch-{index}-attempt-{attempt}-record.json",record)
         else:
             raise Problem("MODEL_SELECTION_INVALID", "有限重试后模型选择仍无效；未猜测修补",details=type(failure).__name__)
     check_choices(lesson,all_choices)
-    frozen=FrozenClues(lesson_version=lesson.version,source_sha256=lesson.source_sha256,
+    checkpoint()
+    if adapter.inspect()["digest"]!=info["digest"]:raise Problem("MODEL_DIGEST_CHANGED","模型运行中版本发生变化")
+    evidence={"schema_version":2,"selection_run_id":run_id,"lesson_version":lesson.version,
+        "lesson_content_version":lesson.content_version,"source_sha256":lesson.source_sha256,
+        "inspection":info,"inspection_sha256":sha256(store.path(root/"inspection.json")),
+        "lesson_sha256":sha256(store.path(root/"lesson.json")),"prompt_sha256":digest(PROMPT),
+        "attempts":attempt_records,"adopted_responses":adopted,
+        "choices":[c.model_dump(mode="json") for c in all_choices],"calls":timings}
+    store.immutable_json(root/"evidence.json",evidence)
+    frozen=FrozenClues(schema_version=2,selection_run_id=run_id,evidence_sha256=sha256(store.path(root/"evidence.json")),
+        lesson_version=lesson.version,source_sha256=lesson.source_sha256,
         choices=tuple(all_choices),model=MODEL,model_digest=info["digest"],ollama_version=info["version"],
         prompt_version=digest(PROMPT),parameters={"batches":all_parameters,"stream":False,"think":False})
-    store.json(f"clues/{frozen.version}.json",frozen)
-    store.json("clues/frozen.json",frozen)
-    store.json("model/metrics.json",{"inspection":info,"calls":timings,
-        "cold_load":"OBSERVED" if not info["already_loaded"] else "NOT_RUN",
-        "warm_call":"OBSERVED" if info["already_loaded"] or len(timings)>1 else "NOT_RUN"})
+    store.immutable_json(f"clues/versions/{frozen.version}.json",frozen)
+    checkpoint()
+    if publish:
+        with store.commit_lock():
+            checkpoint(force_cancel=True)
+            store.json("clues/current.json",{"schema_version":2,"version":frozen.version,"lesson_version":lesson.version})
     return frozen

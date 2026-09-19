@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vocabatron"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local, source-faithful crossword generation and independent PDF verification"
 requires-python = ">=3.12,<3.14"
 dependencies = [
@@ -15,6 +15,7 @@ dependencies = [
   "pydantic>=2.11,<3",
   "pypdfium2>=4.30,<6",
   "Pillow>=11,<13",
+  "numpy>=2,<3",
 ]
 
 [project.scripts]

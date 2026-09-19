@@ -41,20 +41,29 @@ def _fragment(page, bbox, text):
     return Fragment(page=page.page_number, bbox=tuple(bbox), raw=text, char_indices=indices)
 
 
-def ingest(source: Path, expected_lesson: int, store: PrivateStore):
-    from .pdf import inspect_pdf
-    _,security=inspect_pdf(source)
-    store.json("ingest/input-security.json",security)
+def extract_local(source: Path, expected_lesson: int, *, limits=None):
+    from .pdf import _inspect_pdf
+    from .transcription import ordered_evidence, poppler_pages
+    _,security=_inspect_pdf(source)
     source_hash = sha256(source)
     try:
-        poppler = subprocess.run(["pdftotext", "-layout", str(source), "-"],
-                                 check=True, capture_output=True, timeout=60).stdout.decode("utf-8")
+        import tempfile
+        # Bounded file output inherits RLIMIT_FSIZE; never unbounded capture_output.
+        with tempfile.NamedTemporaryFile(suffix=".xml",dir=source.parent) as file:
+            subprocess.run(["/usr/bin/pdftotext", "-bbox-layout", str(source), file.name],
+                           check=True,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL,timeout=60)
+            if Path(file.name).stat().st_size>(limits or {}).get("ipc_bytes",32*1024*1024):
+                raise Problem("RESOURCE_LIMIT","第二提取器输出超限")
+            poppler=Path(file.name).read_text(encoding="utf-8")
     except (OSError, subprocess.SubprocessError, UnicodeError):
         raise Problem("SECOND_EXTRACTOR_UNAVAILABLE", "需要本机 Poppler 文本提取进行交叉核对") from None
     words, titles, page_reports, raw_pages = [], [], [], []
     with pdfplumber.open(source) as pdf:
-        second_pages = poppler.split("\f")
+        second_pages = poppler_pages(poppler)
         for page in pdf.pages:
+            if limits and len(page.chars)>limits["characters"]:
+                raise Problem("RESOURCE_LIMIT", "PDF 字符数量超限")
             if not page.chars:
                 raise Problem("NO_TEXT_LAYER", "原件缺少可读取的文本层；未使用 OCR")
             tables = page.find_tables()
@@ -79,6 +88,9 @@ def ingest(source: Path, expected_lesson: int, store: PrivateStore):
                             if frag.char_indices and all(owned[i] for i in frag.char_indices):
                                 # pdfplumber can infer a nested cell inside a spanning cell.
                                 # These are the same source character objects, not repeated text.
+                                duplicate_evidence=ordered_evidence(frag,page.chars,second_pages[page.page_number-1])
+                                if not duplicate_evidence["table_order_match"] or not duplicate_evidence["poppler_order_match"]:
+                                    raise Problem("TRANSCRIPTION_REQUIRES_DECISION","合并单元格的重复推断文本不一致")
                                 redundant_cells.append({"row":ri,"column":ci,"bbox":bbox,
                                                         "char_indices":frag.char_indices})
                                 continue
@@ -124,17 +136,13 @@ def ingest(source: Path, expected_lesson: int, store: PrivateStore):
                     owned.update(fragment.char_indices)
             missing = [i for i,ch in enumerate(page.chars) if ch["text"].strip() and owned[i] != 1]
             original = Counter(c for ch in page.chars for c in ch["text"] if not c.isspace())
-            other = Counter(c for c in second_pages[page.page_number-1] if not c.isspace())
-            # Independently compare each cell's nonspace characters to the source stream.
-            cell_errors = []
-            for f in record_fragments:
-                a=Counter(c for idx in f.char_indices for c in page.chars[idx]["text"] if not c.isspace())
-                b=Counter(c for c in f.raw if not c.isspace())
-                if a != b:
-                    cell_errors.append(f.bbox)
+            other = Counter(c for w in second_pages[page.page_number-1] for c in w["text"] if not c.isspace())
+            evidence=[ordered_evidence(f,page.chars,second_pages[page.page_number-1])
+                      for f in record_fragments+[t for t in titles if t.page==page.page_number]]
+            cell_errors=[e["bbox"] for e in evidence if not e["table_order_match"] or not e["poppler_order_match"]]
             report = {"page":page.page_number,"characters":len(page.chars),"nonspace":sum(original.values()),
                       "unique_character_ownership":not missing,"cell_character_checks":len(record_fragments),
-                      "cell_errors":cell_errors,"poppler_character_match":original == other,
+                      "ordered_fields":evidence,"cell_errors":cell_errors,"poppler_character_match":original == other,
                       "table_bbox":table.bbox,"record_count":len(starts),
                       "redundant_inferred_cells":redundant_cells,
                       "unassigned_or_duplicate_indices":missing}
@@ -146,18 +154,16 @@ def ingest(source: Path, expected_lesson: int, store: PrivateStore):
     report = {"schema_version":1,"source_sha256":source_hash,"pages":page_reports,
               "original_ordinals":ordinals,"ordinal_sequence_valid":ordinals == list(range(1,len(words)+1)),
               "title_lesson_numbers":sorted(title_numbers),"word_count":len(words),
-              "method":"PDF source character ownership + table cells + original ordinals + Poppler independent extraction",
+              "validator_version":"ordered-spatial-v2",
+              "method":"ordered per-field spatial characters + table strings + Poppler bbox-layout",
               "manual_review":"NOT_PERFORMED"}
     passed = all(p["unique_character_ownership"] and p["poppler_character_match"] and not p["cell_errors"] for p in page_reports)
     report["status"] = "VERIFIED" if passed and report["ordinal_sequence_valid"] else "REQUIRES_REVIEW"
-    store.json("ingest/coverage.json",report)
-    store.json("ingest/raw-pages.json",raw_pages)
-    store.write("ingest/poppler.txt",poppler.encode())
     if report["status"] != "VERIFIED":
         raise Problem("TRANSCRIPTION_REQUIRES_DECISION", "字符覆盖或独立提取不一致；详见私人覆盖报告")
     if title_numbers != {expected_lesson}:
         raise Problem("LESSON_REQUIRES_DECISION", "标题课号与显式课号不一致或无法唯一读取")
-    lesson = Lesson(lesson=expected_lesson,source_sha256=source_hash,title=tuple(titles),words=tuple(words),coverage_sha256=digest(report))
+    lesson = Lesson(schema_version=2,lesson=expected_lesson,source_sha256=source_hash,title=tuple(titles),words=tuple(words),coverage_sha256=digest(report))
     check_input(lesson)
     md = ["# 原始文本转录", "", f"原件 SHA-256：{source_hash}", "", "仅整理表格与排版空白；下列单元格保留原字符串。", ""]
     for f in titles:
@@ -166,13 +172,53 @@ def ingest(source: Path, expected_lesson: int, store: PrivateStore):
         md.extend([f"## 原序号 {w.ordinal}", f"稳定 ID：{w.word_id}", ""])
         for f in w.fields:
             md.extend([f"页 {f.page}；位置 {f.bbox}；字符索引数 {len(f.char_indices)}", "```text",f.raw,"```",""])
-    store.write("ingest/transcript.md",("\n".join(md)+"\n").encode())
-    store.json("ingest/lesson.json",lesson)
-    return lesson, report
+    return {"lesson":lesson.model_dump(mode="json"),"coverage":report,"raw_pages":raw_pages,
+            "poppler":poppler,"transcript":"\n".join(md)+"\n","security":security}
+
+
+def extract(source, expected_lesson):
+    from .supervisor import run_job
+    return run_job("extract",{"source":str(source),"lesson":expected_lesson})
+
+
+def write_bundle(store, root, bundle):
+    root=Path(root)
+    for key,name in (("lesson","lesson.json"),("coverage","coverage.json"),("raw_pages","raw-pages.json"),("security","input-security.json")):
+        store.json(root/name,bundle[key])
+    store.write(root/"poppler.txt",bundle["poppler"].encode())
+    store.write(root/"transcript.md",bundle["transcript"].encode())
+
+
+def ingest(source: Path, expected_lesson: int, store: PrivateStore):
+    """Explicit source import: complete immutable version, then one atomic pointer.
+
+    Application imports additionally snapshot their configuration under the same
+    store lock through services.import_lesson. This lower-level entry has the same
+    publication boundary and never writes the legacy ingest/ files.
+    """
+    import uuid
+    from .execution import checkpoint
+    with store.exclusive():
+        bundle=extract(source,expected_lesson)
+        version=Path("imports")/uuid.uuid4().hex
+        write_bundle(store,version,bundle)
+        with store.commit_lock():
+            checkpoint(force_cancel=True)
+            store.json("current.json",{"schema_version":2,"lesson_path":str(version/"lesson.json"),"frozen_path":None})
+        return Lesson.model_validate(bundle["lesson"]),bundle["coverage"]
 
 
 def check_transcription(source: Path, lesson: Lesson, store: PrivateStore):
-    verified, report = ingest(source, lesson.lesson, store)
-    if verified.version != lesson.version:
-        raise Problem("SOURCE_CHANGED", "重新提取结果与保存版本不符")
-    return report
+    from .transcription import same_content
+    from .execution import checkpoint
+    import uuid
+    root=Path("checks")/uuid.uuid4().hex
+    try:
+        bundle=extract(source,lesson.lesson)
+        checkpoint()
+        write_bundle(store,root,bundle)
+        same_content(lesson,Lesson.model_validate(bundle["lesson"]))
+        return bundle["coverage"]
+    except Problem as exc:
+        store.json(root/"failure.json",{"status":exc.code})
+        raise

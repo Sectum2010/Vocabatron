@@ -32,7 +32,7 @@ UV_CACHE_DIR="$PWD/.cache/uv" UV_PYTHON_DOWNLOADS=never .venv/bin/uv sync --lock
 .venv/bin/vocabatron privacy-scan
 ```
 
-已有有效冻结线索时，`select` 直接复用；需要明确的新选择版本时使用 `select --new-version`。`generate` 可用 `--seconds` 延长每份求解预算、用 `--workers` 限制线程数。中断后使用相同任务 ID 继续；完整验证的第一份布局会被保留，输入版本发生变化则拒绝复用。`cancel TASK_ID` 请求取消，当前求解器通过轮询响应。
+已有有效冻结线索时，`select` 直接复用；需要明确的新选择版本时使用 `select --new-version`。`generate` 可用 `--seconds` 延长每份求解预算、用 `--workers` 限制线程数。中断后使用相同任务 ID 继续；完整验证的两份布局会被保留，输入版本发生变化则拒绝复用。`cancel TASK_ID` 请求取消，取消按执行尝试隔离，覆盖解析、模型请求、求解、导出、验证和发布前边界。
 
 结果只有在双份结构验证、PDF 检查和渲染检查全部通过后，才通过目录原子重命名出现在 `.private/results/TASK_ID/`。完成清单列出两份 PDF、哈希、依赖版本和快照。`rebuild` 只读取保存的模板、布局、课表和冻结线索，不调用模型或求解器。渲染预览与检查报告保存在同一私人结果目录；自动检查不等于人工验收。
 
@@ -50,6 +50,8 @@ UV_CACHE_DIR="$PWD/.cache/uv" .venv/bin/uv build --out-dir .private/packages
 .venv/bin/vocabatron privacy-scan --packages .private/packages
 ```
 
-隐私扫描覆盖 Git 已跟踪、已暂存文件名、未忽略的未跟踪文件，以及指定 wheel/sdist 的内容；检测常见凭据模式、私人配置前缀、当前主机名和已知原文长片段。该检查有明确范围，不能保证识别所有未知敏感字符串。
+隐私扫描分别覆盖工作目录、通过 `ls-files --stage -z` 与 `cat-file` 读取的真实索引 blob，以及有解压容量上限的 wheel/sdist 内容；检测常见凭据模式、私人配置前缀、当前主机名和已知原文长片段。该检查有明确范围，不能保证识别所有未知敏感字符串。
+
+CLI 配置、资源限制和恢复语义见 [docs/cli.md](docs/cli.md)，逐项回归见 [docs/hardening.md](docs/hardening.md)。现有作者、commit message 和历史由用户授权保留；本项目的提交与推送由用户本人执行。
 
 设计、模型编码与后续接口见 [docs/architecture.md](docs/architecture.md)。实际私人验收数量、耗时、输出名称和机器信息只写入 `.private/`。
