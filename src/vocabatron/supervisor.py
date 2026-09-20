@@ -38,10 +38,8 @@ def cleanup_abandoned(root):
 
 
 def output_path(path):
-    path=Path(path).absolute();project=Path(__file__).resolve().parents[2]
-    if path.resolve()!=path or not any(path.is_relative_to(project/name) for name in (".private",".cache")):
-        raise Problem("UNSAFE_PATH","输出必须位于本项目的私人任务目录")
-    return path
+    from .paths import private_path
+    return private_path(path)
 
 
 def pdf_path(path, limits=DEFAULT_LIMITS):
@@ -72,7 +70,8 @@ def run_job(operation, payload, *, limits=None, cancel=None):
     context=CURRENT.get()
     limits=Limits.model_validate((limits or (context.pdf_limits if context else DEFAULT_LIMITS)).model_dump())
     checkpoint()
-    root=Path(__file__).resolve().parents[2]/'.private'/'runtime'
+    from .paths import roots, worker_environment
+    root=roots()[2]
     root.mkdir(mode=0o700,parents=True,exist_ok=True)
     cleanup_abandoned(root)
     job=Path(tempfile.mkdtemp(prefix='job-',dir=root));job.chmod(0o700)
@@ -109,6 +108,7 @@ def run_job(operation, payload, *, limits=None, cancel=None):
         env={'PATH':'/usr/bin:/bin','LANG':'C.UTF-8','LC_ALL':'C.UTF-8',
              'OPENBLAS_NUM_THREADS':'1','OMP_NUM_THREADS':'1','PYTHONHASHSEED':'0',
              'PYTHONPATH':str(Path(__file__).resolve().parents[1]),'TMPDIR':str(job)}
+        env.update(worker_environment())
         launcher=str(_LAUNCHER)
         if ctypes.CDLL(None,use_errno=True).prctl(36,1,0,0,0)!=0:
             raise Problem('WORKER_FAILED','无法启用本任务后代回收')

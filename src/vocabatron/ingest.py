@@ -41,6 +41,34 @@ def _fragment(page, bbox, text):
     return Fragment(page=page.page_number, bbox=tuple(bbox), raw=text, char_indices=indices)
 
 
+
+def word_from_fields(fields, wid, ordinal, page_number):
+    header = [(f, re.fullmatch(r"(.+?)\s*\(([^()]+)\)\s*(\[.*)?", whitespace(f.raw)))
+              for f in fields]
+    header = [(f, m) for f, m in header if m]
+    if len(header) != 1:
+        raise Problem("HEADER_REQUIRES_DECISION", "主词与词性无法唯一识别", details={"page":page_number,"ordinal":ordinal})
+    header_field, match = header[0]
+    candidate_fields = [f for f in fields if re.match(r"^(?:SYN|ANT)ONYM", f.raw, re.I)]
+    candidates = tuple(c for f in candidate_fields for c in split_candidates(f, wid))
+    forms = tuple(f for f in fields if re.match(r"^FORMS\s*:", f.raw, re.I))
+    pronunciation_fields = tuple(f for f in fields if f != header_field and
+                                 (f.raw.strip().startswith("[") or f.raw.strip().endswith("]")))
+    tail = match[3]
+    # Some source tables divide the opening bracket into the main-word cell.
+    # Keep the complete original cell in fields and retain this exact substring.
+    pronunciation = ((header_field.model_copy(update={"raw":tail,"char_indices":()}),)
+                     if tail else ()) + pronunciation_fields
+    remaining = [f for f in fields if f.raw.strip() and f != header_field
+                 and f not in candidate_fields and f not in forms and f not in pronunciation_fields
+                 and f.raw.strip() != ordinal]
+    if len(remaining) != 2:
+        raise Problem("FIELDS_REQUIRE_DECISION", "定义与例句单元格无法唯一识别", details={"page":page_number,"ordinal":ordinal,"count":len(remaining)})
+    word = Word(word_id=wid, ordinal=ordinal, raw=match[1], letters=match[1].upper(),
+                part_of_speech=match[2], pronunciation=pronunciation, forms=forms,
+                definition=(remaining[0],), examples=(remaining[1],), fields=tuple(fields), candidates=candidates)
+    return word
+
 def extract_local(source: Path, expected_lesson: int, *, limits=None):
     from .pdf import _inspect_pdf
     from .transcription import ordered_evidence, poppler_pages
@@ -98,30 +126,7 @@ def extract_local(source: Path, expected_lesson: int, *, limits=None):
                             owned.update(frag.char_indices)
                 ordinal = extracted[start][0].strip()
                 wid = f"w-{digest([source_hash,page.page_number,ordinal])[:16]}"
-                header = [(f, re.fullmatch(r"(.+?)\s*\(([^()]+)\)\s*(\[.*)?", whitespace(f.raw)))
-                          for f in fields]
-                header = [(f, m) for f, m in header if m]
-                if len(header) != 1:
-                    raise Problem("HEADER_REQUIRES_DECISION", "主词与词性无法唯一识别", details={"page":page.page_number,"ordinal":ordinal})
-                header_field, match = header[0]
-                candidate_fields = [f for f in fields if re.match(r"^(?:SYN|ANT)ONYM", f.raw, re.I)]
-                candidates = tuple(c for f in candidate_fields for c in split_candidates(f, wid))
-                forms = tuple(f for f in fields if re.match(r"^FORMS\s*:", f.raw, re.I))
-                pronunciation_fields = tuple(f for f in fields if f != header_field and
-                                             (f.raw.strip().startswith("[") or f.raw.strip().endswith("]")))
-                tail = match[3]
-                # Some source tables divide the opening bracket into the main-word cell.
-                # Keep the complete original cell in fields and retain this exact substring.
-                pronunciation = ((header_field.model_copy(update={"raw":tail,"char_indices":()}),)
-                                 if tail else ()) + pronunciation_fields
-                remaining = [f for f in fields if f.raw.strip() and f != header_field
-                             and f not in candidate_fields and f not in forms and f not in pronunciation_fields
-                             and f.raw.strip() != ordinal]
-                if len(remaining) != 2:
-                    raise Problem("FIELDS_REQUIRE_DECISION", "定义与例句单元格无法唯一识别", details={"page":page.page_number,"ordinal":ordinal,"count":len(remaining)})
-                word = Word(word_id=wid, ordinal=ordinal, raw=match[1], letters=match[1].upper(),
-                            part_of_speech=match[2], pronunciation=pronunciation, forms=forms,
-                            definition=(remaining[0],), examples=(remaining[1],), fields=tuple(fields), candidates=candidates)
+                word = word_from_fields(fields, wid, ordinal, page.page_number)
                 words.append(word)
                 record_fragments.extend(fields)
             outside = [i for i,ch in enumerate(page.chars) if not owned[i]]

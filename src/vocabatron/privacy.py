@@ -28,24 +28,57 @@ PATTERNS={
 MAX_FILE=4*1024*1024
 MAX_ARCHIVE_FILES=2000
 MAX_ARCHIVE_TOTAL=32*1024*1024
+# Reviewed against the integrity-checked npm pdfjs-dist 5.7.284 archive. One
+# apparent email occurs inside encoded built-in text-analysis data. This exact
+# immutable asset is not a personal address exemption; changed bytes fail the
+# ordinary rule, and private-source/secret checks still scan the entire asset.
+VENDOR_ENCODED_DATA=frozenset({'52fadd5b81b6abd1eb665bab0c3749a8ad6a293fcb6ee9d9e0309f29d4f82619'})
+PUBLIC_PNG={
+    'frontend/public/icons/icon-192.png':(192,192),
+    'frontend/public/icons/icon-512.png':(512,512),
+    'frontend/public/icons/maskable-512.png':(512,512),
+    'frontend/public/icons/apple-touch-icon.png':(180,180),
+}
 
 
 def allowed_name(name,*,package=False):
     p=PurePosixPath(name)
     if not p.parts or p.is_absolute() or '..' in p.parts or '\\' in name:return False
-    if any(x.startswith('.private') or x in {'.venv','.cache','__pycache__'} for x in p.parts):return False
+    if any(x.startswith('.private') or x in {'.venv','.cache','__pycache__','Outputs','node_modules','test-results','playwright-report'} for x in p.parts):return False
+    if name in PUBLIC_PNG:return True
+    if package and any(name.endswith('/'+key) for key in PUBLIC_PNG):return True
     if p.suffix.lower() in {'.pdf','.png','.jpg','.sqlite','.db','.log','.pyc'}:return False
     if package:return True
-    return name in {'.gitignore','AGENTS.md','README.md','pyproject.toml','uv.lock','config.example.json'} or p.parts[0] in {'src','tests','docs'}
+    return name in {'.gitignore','AGENTS.md','README.md','pyproject.toml','uv.lock','config.example.json'} or p.parts[0] in {'src','tests','docs','frontend','deploy'}
 
 
 def inspect_text(name,data,private_terms=()):
+    icon=next((key for key in PUBLIC_PNG if name==key or name.endswith('/'+key)),None)
+    if icon:
+        # Explicit code-generated, opaque icon assets only. Reject metadata and
+        # additional PNG chunks which could smuggle private text or attachments.
+        import io
+        from PIL import Image
+        try:
+            image=Image.open(io.BytesIO(data));image.verify()
+            if image.format!='PNG' or image.size!=PUBLIC_PNG[icon] or len(data)>128*1024:raise ValueError()
+            offset=8
+            if data[:8]!=b'\x89PNG\r\n\x1a\n':raise ValueError()
+            while offset<len(data):
+                length=int.from_bytes(data[offset:offset+4],'big');kind=data[offset+4:offset+8]
+                if kind not in (b'IHDR',b'IDAT',b'IEND'):raise ValueError()
+                offset+=length+12
+            if offset!=len(data):raise ValueError()
+            return []
+        except Exception:return [{'file':name,'rule':'public_icon_invalid'}]
     try:text=data.decode('utf-8')
     except UnicodeError:return [{'file':name,'rule':'unexpected_binary'}]
     issues=[{'file':name,'rule':label} for label,pattern in PATTERNS.items() if pattern.search(text)]
     emails=re.findall(r'\b[A-Za-z0-9_.+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b',text)
-    if any(not mail.endswith(('.invalid','@example.org','@example.com')) for mail in emails):issues.append({'file':name,'rule':'personal_email_in_content'})
-    if any(value and value in text for value in private_terms):issues.append({'file':name,'rule':'private_value'})
+    if any(not mail.endswith(('.invalid','@example.org','@example.com','@example.test')) for mail in emails):
+        if hashlib.sha256(data).hexdigest() not in VENDOR_ENCODED_DATA:issues.append({'file':name,'rule':'personal_email_in_content'})
+    matched=private_terms.matches(text) if hasattr(private_terms,'matches') else any(value and value in text for value in private_terms)
+    if matched:issues.append({'file':name,'rule':'private_value'})
     return issues
 
 
@@ -129,12 +162,18 @@ def scan(project: Path,packages: Path|None=None,*,runner=None):
     private_terms=[]
     config=project/'.private/config.json'
     if config.is_file():private_terms.extend(json.loads(config.read_text()).get('prefixes',[]))
+    web_config=project/'.private/web/config.json'
+    if web_config.is_file():
+        web=json.loads(web_config.read_text());private_terms.extend(web.get('allowed_logins',[]))
+        private_terms.extend([web.get('public_base_url',''),web.get('csrf_secret','')])
     host=socket.gethostname()
     if len(host)>5:private_terms.append(host)
     lesson=project/'.private/ingest/lesson.json'
     if lesson.is_file():
         data=json.loads(lesson.read_text());fragments=data.get('title',[])+[f for w in data.get('words',[]) for f in w.get('fields',[])]
         private_terms.extend(f['raw'] for f in fragments if len(f['raw'])>=40)
+    from .private_fingerprints import source_fingerprints
+    private_terms,coverage=source_fingerprints(project,private_terms)
     issues=[];archives=[];index=[];candidates=[];staged=[]
     for attempt in range(2):
         issues=[];index=[]
@@ -180,10 +219,22 @@ def scan(project: Path,packages: Path|None=None,*,runner=None):
         for path in sorted(package_root.iterdir()):
             if path.name.endswith(('.whl','.tar.gz')):
                 report=inspect_archive(path,private_terms);archives.append(report);issues.extend({'scope':'ARCHIVE',**x} for x in report['issues'])
+    frontend=project/'frontend/dist';frontend_files=0
+    if frontend.exists():
+        for path in frontend.rglob('*'):
+            if path.is_dir():continue
+            frontend_files+=1;name=str(path.relative_to(project))
+            if path.is_symlink() or path.resolve()!=path or path.stat().st_size>MAX_FILE:
+                issues.append({'scope':'FRONTEND','file':name,'rule':'unsupported_file_or_size'});continue
+            mapped='frontend/public/'+str(path.relative_to(frontend))
+            if path.suffix.lower()=='.map':issues.append({'scope':'FRONTEND','file':name,'rule':'production_source_map'})
+            issues.extend({'scope':'FRONTEND',**x} for x in inspect_text(mapped,path.read_bytes(),private_terms))
     result={'status':'PASSED' if not issues else 'FAILED','scopes':['WORKTREE','INDEX','ARCHIVE' if packages else 'ARCHIVE_NOT_RUN'],
         'tracked_files':len(index),'staged_files':len([x for x in staged if x]),'public_candidates':len(candidates),
         'candidate_files':candidates,'index_blob_source':'git ls-files --stage -z + git cat-file blob OID',
         'metadata_scope':'Commit messages, authors and history intentionally excluded; no content email exemption.',
-        'archives':archives,'issues':issues,'limits':'Bounded pattern and known-value audit; not arbitrary-secret detection.'}
+        'vendor_pattern_review':'One byte-identical integrity-checked PDF.js asset contains an encoded-data false positive; all changed content and known private values remain checked.',
+        'archives':archives,'frontend_files':frontend_files,'frontend_status':'INSPECTED' if frontend.exists() else 'NOT_BUILT',
+        'private_coverage':coverage,'issues':issues,'limits':'Bounded pattern and known-value audit; not arbitrary-secret detection.'}
     if issues:raise Problem('PRIVACY_SCAN_FAILED','公开内容审计失败或范围未完整读取',details=result)
     return result

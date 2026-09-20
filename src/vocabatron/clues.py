@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import uuid
 from pathlib import Path
 import time
@@ -87,17 +88,23 @@ def budget(words):
     output = max(512, math.ceil(len(json.dumps(expected))/2)+256)
     need = math.ceil((len(json.dumps(payload))+len(PROMPT))/2)+output+512
     context = max(4096, 2**math.ceil(math.log2(need)))
-    return payload, {"temperature":0,"seed":37,"num_ctx":context,"num_predict":output,"num_thread":4}
+    return payload, {"temperature":0,"seed":37,"num_ctx":context,"num_predict":output,"num_thread":min(4,int(os.environ.get('VOCABATRON_THREAD_BUDGET','4')))}
 
 
-def select(lesson: Lesson, adapter: Ollama, store, retries=2, *, publish=True):
+def select(lesson: Lesson, adapter: Ollama, store, retries=2, *, publish=True, run_id=None, before_request=None):
     from .execution import checkpoint
-    from .storage import sha256
+    from .storage import sha256,identifier
     checkpoint()
     if not isinstance(retries,int) or not 0<=retries<=3:raise Problem("INPUT_INVALID","模型重试次数不合法")
-    run_id=uuid.uuid4().hex;root=Path("model/runs")/run_id
+    run_id=identifier(run_id or uuid.uuid4().hex);root=Path("model/runs")/run_id
+    if before_request:before_request()
     info = adapter.inspect()
-    store.immutable_json(root/"inspection.json",info)
+    if store.path(root/"inspection.json").exists():
+        previous=store.read(root/"inspection.json")
+        if previous['digest']!=info['digest'] or previous['version']!=info['version']:
+            raise Problem('MODEL_DIGEST_CHANGED','The saved selection run uses a different local model version')
+        info=previous
+    else:store.immutable_json(root/"inspection.json",info)
     store.immutable_json(root/"lesson.json",lesson)
     adopted=[];attempt_records=[]
     groups, group = [], []
@@ -123,17 +130,53 @@ def select(lesson: Lesson, adapter: Ollama, store, retries=2, *, publish=True):
         schema["$defs"]["Choice"]["properties"]["word_id"]["enum"]=[w.word_id for w in words]
         schema["$defs"]["Choice"]["properties"]["candidate_id"]["enum"]=[c.candidate_id for w in words for c in w.candidates]
         subset=lesson.model_copy(update={"words":tuple(words)})
+        adopted_path=root/f"batch-{index}-adopted.json"
+        if store.path(adopted_path).exists():
+            saved=store.read(adopted_path);record=store.read(root/saved['record'])
+            for key in ('request','response'):
+                if sha256(store.path(root/record[key]))!=record[key+'_sha256']:
+                    raise Problem('MODEL_EVIDENCE_CHANGED','Partial selection evidence changed')
+            response=store.read(root/record['response'])
+            if digest(store.read(root/record['request'])['format'])!=digest(schema):
+                raise Problem('MODEL_EVIDENCE_MISMATCH','Partial selection schema changed')
+            parsed=Selection.model_validate_json(response['message']['content']);check_choices(subset,parsed.choices)
+            all_parameters[-1]=record['parameters']
+            all_choices.extend(parsed.choices);adopted.append(record['response'])
+            attempt_records.extend(store.read(p.relative_to(store.root)) for p in sorted(store.path(root).glob(f'batch-{index}-attempt-*-record.json')))
+            timings.extend(r['timing'] for r in attempt_records if r.get('batch')==index and 'timing' in r)
+            continue
         failure=None
-        for attempt in range(retries+1):
+        old_records=[store.read(p.relative_to(store.root)) for p in sorted(store.path(root).glob(f'batch-{index}-attempt-*-record.json'))]
+        attempt_records.extend(old_records)
+        timings.extend(r['timing'] for r in old_records if 'timing' in r)
+        failures=sum(bool(r.get('retry_reason')) for r in old_records)
+        issued=list(store.path(root).glob(f'batch-{index}-attempt-*-request.json'))
+        next_attempt=max((int(p.name.split('-')[3]) for p in issued),default=-1)+1
+        for attempt in range(next_attempt,next_attempt+max(0,retries+1-failures)):
             started=time.perf_counter()
             checkpoint()
+            if before_request:before_request()
             request={"model":MODEL,"stream":False,"think":False,"keep_alive":"5m",
                 "format":schema,"options":parameters,"messages":[{"role":"system","content":PROMPT},
                 {"role":"user","content":json.dumps({"untrusted_source_data":payload},ensure_ascii=False)}]}
             request_name=f"batch-{index}-attempt-{attempt}-request.json"
             response_name=f"batch-{index}-attempt-{attempt}-response.json"
             store.immutable_json(root/request_name,request)
-            response=adapter.request("chat",request)
+            try:response=adapter.request("chat",request)
+            except Problem as exc:
+                if exc.code not in {'OLLAMA_UNAVAILABLE','MODEL_REQUEST_TIMEOUT'}:raise
+                record={'batch':index,'attempt':attempt,'request':request_name,'response':None,
+                        'request_sha256':sha256(store.path(root/request_name)),'retry_reason':exc.code,
+                        'timing':{'wall_seconds':time.perf_counter()-started,'completed':False}}
+                store.immutable_json(root/f"batch-{index}-attempt-{attempt}-record.json",record)
+                attempt_records.append(record);failure=exc
+                # Application callers release their resource reservation and
+                # resume this immutable run through the persistent retry queue.
+                if before_request:raise
+                if attempt==next_attempt+retries-failures:raise
+                until=time.monotonic()+min(2**(attempt-next_attempt),4)
+                while time.monotonic()<until:checkpoint();time.sleep(.05)
+                continue
             store.immutable_json(root/response_name,response)
             checkpoint()
             record={"batch":index,"attempt":attempt,"request":request_name,"response":response_name,
@@ -144,6 +187,7 @@ def select(lesson: Lesson, adapter: Ollama, store, retries=2, *, publish=True):
             attempt_records.append(record)
             timings.append({"batch":index,"attempt":attempt,"wall_seconds":time.perf_counter()-started,
                 **{k:response.get(k) if isinstance(response,dict) else None for k in ("load_duration","total_duration","prompt_eval_duration","eval_duration","prompt_eval_count","eval_count","done_reason")}})
+            record['timing']=timings[-1]
             try:
                 if not isinstance(response,dict):raise Problem("MODEL_RESPONSE_MISMATCH","模型响应格式不合法")
                 if response.get("model")!=MODEL:
@@ -154,6 +198,9 @@ def select(lesson: Lesson, adapter: Ollama, store, retries=2, *, publish=True):
                 check_choices(subset,parsed.choices)
                 all_choices.extend(parsed.choices)
                 adopted.append(response_name)
+                checkpoint()
+                store.immutable_json(root/f"batch-{index}-attempt-{attempt}-record.json",record)
+                store.immutable_json(adopted_path,{'record':f'batch-{index}-attempt-{attempt}-record.json','response':response_name})
                 break
             except (ValidationError,Problem) as e:
                 failure=e

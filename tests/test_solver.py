@@ -17,6 +17,9 @@ def test_dynamic_two_witnesses_and_exact_complete_domain(count):
     expected=sum(2*20*(21-len(w.letters)) for w in lesson.words)
     assert model.metrics["placements"]==expected
     model.hint(a)
+    assert model.metrics['complete_auxiliary_hint']
+    # Hints cover auxiliary consistency without fixing the placement domain.
+    assert len(model.model.proto.solution_hint.vars)==model.metrics['variables']
     first,_=model.solve(SolverOptions(workers=1,seconds_per_layout=90))
     validate_layout(lesson,first)
     model.exclude_fingerprint(validate_layout(lesson,first)["crossings"])
@@ -136,3 +139,17 @@ def test_partial_warm_hint_does_not_assign_missing_words_false():
     assert all(x.index not in hinted for x,p in model.placements[lesson.words[1].word_id])
     layout,metrics=model.solve(SolverOptions(seconds_per_layout=5,workers=1))
     assert len(layout.placements)==2
+
+
+def test_complete_auxiliary_hint_remains_soft_after_exclusion():
+    lesson=lesson_of(['AB','AC']);model=ExactModel(lesson,size=3)
+    old=Layout(lesson_version=lesson.version,size=3,placements=(
+        Placement(word_id=lesson.words[0].word_id,row=0,col=0,direction='across'),
+        Placement(word_id=lesson.words[1].word_id,row=0,col=0,direction='down')))
+    model.exclude_layout(old);before=len(model.model.proto.constraints)
+    model.hint(old)
+    assert model.metrics['complete_auxiliary_hint']
+    assert len(model.model.proto.constraints)==before
+    replacement,_=model.solve(SolverOptions(workers=1,seconds_per_layout=5))
+    validate_layout(lesson,replacement)
+    assert set(replacement.placements)!=set(old.placements)

@@ -1,5 +1,10 @@
 # Private inputs, configuration and all generated material stay local.
 /.private/
+/Outputs/
+/frontend/node_modules/
+/frontend/dist/
+/frontend/test-results/
+/frontend/playwright-report/
 /.venv/
 /.cache/
 /.pytest_cache/
@@ -15,6 +20,10 @@ htmlcov/
 .env.*
 *.pdf
 *.png
+!/frontend/public/icons/icon-192.png
+!/frontend/public/icons/icon-512.png
+!/frontend/public/icons/maskable-512.png
+!/frontend/public/icons/apple-touch-icon.png
 *.jpg
 *.sqlite*
 *.db

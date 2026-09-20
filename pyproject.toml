@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vocabatron"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local, source-faithful crossword generation and independent PDF verification"
 requires-python = ">=3.12,<3.14"
 dependencies = [
@@ -16,19 +16,31 @@ dependencies = [
   "pypdfium2>=4.30,<6",
   "Pillow>=11,<13",
   "numpy>=2,<3",
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.34,<1",
+  "python-multipart>=0.0.20,<1",
+  "apsw>=3.51.3.0,<4",
+  "psutil>=7,<8",
 ]
 
 [project.scripts]
 vocabatron = "vocabatron.cli:main"
+vocabatron-web = "vocabatron.app.api:main"
+vocabatron-worker = "vocabatron.app.cli:worker_main"
 
 [dependency-groups]
-dev = ["pytest>=8,<10", "build>=1.2,<2"]
+dev = [
+    "pytest>=8,<10",
+    "build>=1.2,<2",
+    "httpx>=0.28,<1",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vocabatron"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/docs", "/AGENTS.md", "/README.md", "/pyproject.toml", "/uv.lock", "/config.example.json", "/.gitignore"]
+include = ["/src", "/tests", "/docs", "/frontend", "/deploy", "/AGENTS.md", "/README.md", "/pyproject.toml", "/uv.lock", "/config.example.json", "/.gitignore"]
+exclude = ["/frontend/node_modules", "/frontend/dist", "/frontend/test-results", "/frontend/playwright-report", "/Outputs", "/.private", "/.cache"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

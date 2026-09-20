@@ -23,8 +23,9 @@ def verify_evidence(store,lesson,frozen):
         if saved.version!=lesson.version:raise Problem('MODEL_EVIDENCE_MISMATCH','证据课表不符')
         adopted=evidence['adopted_responses']
         if not adopted or len(set(adopted))!=len(adopted):raise Problem('MODEL_EVIDENCE_MISMATCH','采用的响应列表不完整')
-        records={r['response']:r for r in evidence['attempts']}
-        if len(records)!=len(evidence['attempts']):raise Problem('MODEL_EVIDENCE_MISMATCH','响应记录重复')
+        responded=[r for r in evidence['attempts'] if isinstance(r.get('response'),str)]
+        records={r['response']:r for r in responded}
+        if len(records)!=len(responded):raise Problem('MODEL_EVIDENCE_MISMATCH','响应记录重复')
         choices=[]
         for name in adopted:
             record=records[name]

@@ -86,11 +86,16 @@ def synthetic_handout(path: Path):
     c.showPage();c.save()
 
 
-def synthetic_course(path,answers,number=3):
+def synthetic_course(path,answers,number=3,*,positioned_heading=False):
     """Invented multipage source; layout witnesses are never encoded in the PDF."""
     c=canvas.Canvas(str(path),pagesize=(612,792),invariant=1)
     for page_start in range(0,len(answers),7):
-        c.setFont('Helvetica',11);c.drawString(70,748,f'Invented Classroom Lesson {number} Words')
+        c.setFont('Helvetica',11)
+        if positioned_heading:
+            c.drawString(70,775,'Invented classroom')
+            c.drawString(70,750,'Vocabulary');c.drawString(145,750,f'Lesson {number} Words')
+            c.drawString(70,728,'An invented subtitle')
+        else:c.drawString(70,748,f'Invented Classroom Lesson {number} Words')
         for index,word in enumerate(answers[page_start:page_start+7]):
             ordinal=page_start+index+1;top=700-index*90;bottom=top-90
             for x in (50,75,560):c.line(x,bottom,x,top)

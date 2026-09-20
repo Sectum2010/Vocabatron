@@ -1,3 +1,3 @@
-"""Vocabatron: UI-independent local application core."""
+"""Vocabatron: private local crossword library, web application and verified core."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

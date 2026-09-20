@@ -97,6 +97,16 @@ def test_manifest_fail_closed(production_pair,tmp_path,mode):
     with pytest.raises(Problem):services.verify_set(s,'base')
 
 
+def test_early_manifest_migration_retains_missing_provenance(production_pair):
+    data=production_pair.read('results/base/manifest.json')
+    data['schema_version']=1;data.pop('generator_source_sha256')
+    with pytest.raises(Problem):validate_manifest(data,'base')
+    accepted=validate_manifest(data,'base',allow_legacy_missing_source=True)
+    assert accepted.generator_source_sha256 is None
+    data['snapshot_hashes'].pop('lesson.json')
+    with pytest.raises(Problem):validate_manifest(data,'base',allow_legacy_missing_source=True)
+
+
 @pytest.mark.parametrize('mode',['prefix','lesson','frozen','template','style','seed','provenance'])
 def test_delivery_identity_changes_and_execution_budget_does_not(production_pair,mode,monkeypatch):
     s=production_pair;config,lesson,frozen=services.load_inputs(s);th=sha256(s.path(config.template))

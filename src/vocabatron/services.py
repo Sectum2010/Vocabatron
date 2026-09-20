@@ -47,6 +47,11 @@ def import_lesson(store, *, task_id=None, progress=None):
             bundle=extract(store.path(config.source),config.lesson)
             lesson=Lesson.model_validate(bundle["lesson"])
             if config.expected_words is not None and len(lesson.words)!=config.expected_words:raise Problem("INPUT_INVALID","词数与显式配置不符")
+            try:previous,previous_pointer=current_lesson(store)
+            except FileNotFoundError:previous,previous_pointer=None,None
+            if previous is not None and previous.version==lesson.version:
+                result={"status":"VERIFIED","words":len(lesson.words),"lesson":lesson.lesson,"version":lesson.version,"reused":True}
+                context.finish("COMPLETE",result);return result
             version=Path("imports")/context.attempt_id
             write_bundle(store,version,bundle)
             context.emit("PUBLISHING_IMPORT")
@@ -231,9 +236,9 @@ def generate(store,task_id=None,options=None,progress=None):
             return result
 
 
-def _read_result(store,task_id):
+def _read_result(store,task_id,*,allow_legacy_missing_source=False):
     root=Path("results")/identifier(task_id);manifest=store.read(root/"manifest.json")
-    validate_manifest(manifest,task_id)
+    validate_manifest(manifest,task_id,allow_legacy_missing_source=allow_legacy_missing_source)
     for name,expected in manifest["snapshot_hashes"].items():
         if Path(name).name!=name:raise Problem("UNSAFE_PATH","快照名称不合法")
         if sha256(store.path(root/name))!=expected:raise Problem("SNAPSHOT_CHANGED","结果快照哈希不符")
@@ -347,14 +352,14 @@ def benchmark_model(store,sample_words=1):
     root=Path("benchmarks")/("model-"+uuid.uuid4().hex[:12])
     measurements=[]
     with store.exclusive():
-        original_hash=sha256(store.path("clues/frozen.json"))
+        original_version=frozen.version
         for label in ("initial","warm"):
             scoped=PrivateStore(store.path(root/label))
             selected=select(subset,Ollama(),scoped)
             metrics=scoped.read(f"model/runs/{selected.selection_run_id}/evidence.json")
             measurements.append({"label":label,"sample_words":sample_words,
                 "already_loaded":metrics["inspection"]["already_loaded"],"calls":metrics["calls"]})
-        if sha256(store.path("clues/frozen.json"))!=original_hash:
+        if load_inputs(store)[2].version!=original_version:
             raise Problem("FROZEN_SELECTION_CHANGED","性能采样意外改变正式冻结版本")
         report={"status":"MEASURED","scope":"small identical protocol sample, not full-lesson latency",
                 "measurements":measurements,"frozen_version_unchanged":frozen.version}

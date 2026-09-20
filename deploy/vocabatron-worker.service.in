@@ -1,0 +1,57 @@
+[Unit]
+Description=Vocabatron persistent low priority worker
+After=network.target
+StartLimitIntervalSec=120s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+Slice=vocabatron.slice
+WorkingDirectory=@CODE_ROOT@
+Environment=VOCABATRON_CONFIG=@CONFIG@
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=1
+ExecStart=@PYTHON@ -m vocabatron.app.cli
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=15s
+KillMode=control-group
+UMask=0077
+Nice=19
+CPUSchedulingPolicy=idle
+IOSchedulingClass=idle
+CPUWeight=idle
+CPUQuota=180%
+MemoryHigh=5G
+MemoryMax=7G
+MemorySwapMax=0
+TasksMax=96
+IOWeight=1
+OOMPolicy=stop
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=read-only
+InaccessiblePaths=-/run/docker.sock -/run/containerd/containerd.sock -/run/user/@UID@/docker.sock
+ReadWritePaths=@DATA_ROOT@ @RUNTIME_ROOT@ @OUTPUTS_ROOT@
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LimitCORE=0
+LimitNOFILE=256
+LimitFSIZE=512M
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=100
+
+[Install]
+WantedBy=multi-user.target

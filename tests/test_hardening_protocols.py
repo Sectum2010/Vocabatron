@@ -100,7 +100,14 @@ def test_import_failure_and_check_do_not_replace_current(tmp_path,monkeypatch):
         if str(path)=='current.json':raise PermissionError('simulated pointer publication interruption')
         return original(path,value)
     monkeypatch.setattr(s,'json',fail)
-    with pytest.raises(PermissionError):services.import_lesson(s)
+    # An identical import reuses its frozen state and has no pointer write to
+    # interrupt. Exercise publication failure with a distinct invented source.
+    assert services.import_lesson(s)['reused']
+    s.path('sources/replacement.pdf').write_bytes(s.path(config.source).read_bytes()+b'\n% Invented replacement packaging\n')
+    s.json('config.json',config.model_copy(update={'source':'sources/replacement.pdf'}))
+    try:
+        with pytest.raises(PermissionError):services.import_lesson(s)
+    finally:s.json('config.json',config)
     assert sha256(s.path('current.json'))==pointer
     assert services.load_inputs(s)[2].version==frozen.version
 

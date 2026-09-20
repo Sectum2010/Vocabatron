@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import random
+import os
 import resource
 import threading
 import time
@@ -120,14 +121,15 @@ def warm_hint(lesson,size,seed,seconds=8,exclude=None):
 
 
 class ExactModel:
-    def __init__(self,lesson,size=20,clue_costs=None,capacities=None,budget_check=None):
-        check_input(lesson,size);static_graph(lesson)
+    def __init__(self,lesson,size=20,clue_costs=None,capacities=None,budget_check=None,check_graph=True):
+        check_input(lesson,size)
+        if check_graph:static_graph(lesson)
         started=time.perf_counter()
         self.lesson,self.size=lesson,size
         m=self.model=cp_model.CpModel()
         by_cell=defaultdict(list);by_edge=defaultdict(list)
         self.placements={};self.positions={};self.crossings={};self.edges={}
-        self.lookup={}
+        self.lookup={};self.hint_cells={};self.hint_pairs={};self.hint_crossings=[];self.flows={}
         for wi,word in enumerate(lesson.words):
             checkpoint()
             if budget_check:budget_check()
@@ -157,10 +159,12 @@ class ExactModel:
                     m.add(occ==sum(x for x,ch in by_cell[r,c,d]))
                     letter=m.new_int_var(0,26,f"l{r}_{c}_{d}")
                     m.add(letter==sum(x*ch for x,ch in by_cell[r,c,d]))
+                    self.hint_cells[r,c,d]=(occ,letter)
                     ds.append(occ);letters.append(letter)
                 m.add(letters[0]==letters[1]).only_enforce_if(ds)
                 occ=m.new_bool_var(f"occupied{r}_{c}")
                 m.add_max_equality(occ,ds);occupied[r,c]=occ
+        self.occupied=occupied
         for r in range(size):
             for c in range(size):
                 for d in (0,1):
@@ -177,6 +181,7 @@ class ExactModel:
                 if not matches:continue
                 rb,cb,db=self.positions[b.word_id]
                 different=m.new_bool_var("different_direction")
+                self.hint_pairs[a.word_id,b.word_id]=different
                 m.add(da!=db).only_enforce_if(different);m.add(da==db).only_enforce_if(different.Not())
                 xs=[]
                 for ia,ib in matches:
@@ -189,12 +194,14 @@ class ExactModel:
                     m.add_bool_or([different.Not(),equal_r.Not(),equal_c.Not(),x])
                     key=(a.word_id,ia,b.word_id,ib) if a.word_id<b.word_id else (b.word_id,ib,a.word_id,ia)
                     self.crossings[key]=x;xs.append(x)
+                    self.hint_crossings.append((a.word_id,ia,b.word_id,ib,equal_r,equal_c,x))
                 edge=m.new_bool_var("edge");m.add(edge==sum(xs))
                 self.edges[a.word_id,b.word_id]=edge
         n=len(lesson.words)
         balances=defaultdict(list)
         for (a,b),e in self.edges.items():
             ab=m.new_int_var(0,n-1,"flow");ba=m.new_int_var(0,n-1,"flow")
+            self.flows[a,b]=(ab,ba)
             m.add(ab<=(n-1)*e);m.add(ba<=(n-1)*e)
             balances[a].extend([ab,-ba]);balances[b].extend([ba,-ab])
         for i,w in enumerate(lesson.words):m.add(sum(balances[w.word_id])==(n-1 if i==0 else -1))
@@ -208,11 +215,51 @@ class ExactModel:
 
     def hint(self,layout):
         self.model.clear_hints()
+        self.metrics.update(hinted_variables=0,complete_auxiliary_hint=False)
         if layout is None:return
         chosen={(p.word_id,p.row,p.col,int(p.direction=="down")) for p in layout.placements}
         supplied={p.word_id for p in layout.placements}
+        hinted=set()
+        def suggest(variable,value):
+            self.model.add_hint(variable,int(value));hinted.add(variable.index)
         for key,x in self.lookup.items():
-            if key[0] in supplied:self.model.add_hint(x,int(key in chosen))
+            if key[0] in supplied:suggest(x,key in chosen)
+        self.metrics['hinted_variables']=len(hinted)
+        if supplied!={w.word_id for w in self.lesson.words}:return
+        try:validate_layout(self.lesson,layout)
+        except Problem:return
+        # Complete a valid placement hint with a deterministic spanning-tree
+        # flow. These are still soft hints: no domain, assumption or hard
+        # constraint is added, and auxiliary flows never define a variant.
+        positions={p.word_id:p for p in layout.placements};board={}
+        for word in self.lesson.words:
+            p=positions[word.word_id];down=int(p.direction=='down')
+            for variable,value in zip(self.positions[word.word_id],(p.row,p.col,down)):suggest(variable,value)
+            for index,char in enumerate(word.letters):board[p.row+index*down,p.col+index*(1-down),down]=ord(char)-64
+        for key,(occupied,letter) in self.hint_cells.items():
+            suggest(occupied,key in board);suggest(letter,board.get(key,0))
+        for (r,c),occupied in self.occupied.items():suggest(occupied,(r,c,0) in board or (r,c,1) in board)
+        for (a,b),different in self.hint_pairs.items():suggest(different,positions[a].direction!=positions[b].direction)
+        adjacency={w.word_id:set() for w in self.lesson.words}
+        for a,ia,b,ib,equal_r,equal_c,crossing in self.hint_crossings:
+            pa,pb=positions[a],positions[b];da,db=int(pa.direction=='down'),int(pb.direction=='down')
+            row=pa.row+ia*da==pb.row+ib*db;col=pa.col+ia*(1-da)==pb.col+ib*(1-db)
+            crossed=da!=db and row and col
+            suggest(equal_r,row);suggest(equal_c,col);suggest(crossing,crossed)
+            if crossed:adjacency[a].add(b);adjacency[b].add(a)
+        for (a,b),edge in self.edges.items():suggest(edge,b in adjacency[a])
+        root=self.lesson.words[0].word_id;parents={root:None};order=[root]
+        for a in order:
+            for b in sorted(adjacency[a]):
+                if b not in parents:parents[b]=a;order.append(b)
+        sizes={w.word_id:1 for w in self.lesson.words};flow={}
+        for child in reversed(order[1:]):
+            parent=parents[child];flow[parent,child]=sizes[child];sizes[parent]+=sizes[child]
+        for (a,b),(ab,ba) in self.flows.items():suggest(ab,flow.get((a,b),0));suggest(ba,flow.get((b,a),0))
+        for index,variable in enumerate(self.model.proto.variables):
+            if index not in hinted and len(variable.domain)==2 and variable.domain[0]==variable.domain[1]:
+                suggest(self.model.get_int_var_from_proto_index(index),variable.domain[0])
+        self.metrics.update(hinted_variables=len(hinted),complete_auxiliary_hint=len(hinted)==len(self.model.proto.variables))
 
     def exclude_layout(self,layout):
         variables=[self.lookup[p.word_id,p.row,p.col,int(p.direction=="down")] for p in layout.placements]
@@ -251,7 +298,8 @@ class ExactModel:
     def solve(self,options: SolverOptions,cancel=None):
         checkpoint()
         if cancel and cancel():raise Problem("CANCELLED","精确求解已取消")
-        solver=cp_model.CpSolver();solver.parameters.num_search_workers=options.workers
+        threads=min(options.workers,int(os.environ.get('VOCABATRON_THREAD_BUDGET',options.workers)))
+        solver=cp_model.CpSolver();solver.parameters.num_search_workers=threads
         solver.parameters.random_seed=options.seed;solver.parameters.max_time_in_seconds=options.seconds_per_layout
         solver.parameters.repair_hint=True
         completed=threading.Event()
@@ -266,7 +314,7 @@ class ExactModel:
         checkpoint()
         if cancel and cancel():raise Problem("CANCELLED","精确求解已取消")
         name=solver.status_name(status)
-        metrics={"status":name,"seconds":time.perf_counter()-start,"workers":options.workers,
+        metrics={"status":name,"seconds":time.perf_counter()-start,"workers":threads,
                  "hint_repair":True,
                  "seed":options.seed,"branches":solver.num_branches,"conflicts":solver.num_conflicts,
                  "peak_rss_kib":resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}

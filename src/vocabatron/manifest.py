@@ -47,9 +47,17 @@ class Manifest(Record):
         return self
 
 
-def validate_manifest(value,task_id):
+class LegacyManifest(Manifest):
+    # Early schema 1 releases did not record the generator source fingerprint.
+    # Migration can retain that explicit provenance gap while independently
+    # checking every snapshot and PDF. Never synthesize a historical hash.
+    generator_source_sha256:str|None=Field(default=None,pattern=r'^[a-f0-9]{64}$')
+
+
+def validate_manifest(value,task_id,*,allow_legacy_missing_source=False):
     from pydantic import ValidationError
-    try:manifest=Manifest.model_validate(value)
+    schema=LegacyManifest if allow_legacy_missing_source and value.get('schema_version')==1 and 'generator_source_sha256' not in value else Manifest
+    try:manifest=schema.model_validate(value)
     except (ValidationError,Problem):raise Problem('INCOMPLETE_SET','结果清单缺失必需字段或格式不合法') from None
     if manifest.task_id!=task_id:raise Problem('INCOMPLETE_SET','清单任务 ID 与目录不符')
     return manifest

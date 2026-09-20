@@ -33,9 +33,8 @@ class PrivateStore:
     def __init__(self, root: Path):
         self.root = root.absolute()
         self._held=threading.local()
-        project=Path(__file__).resolve().parents[2]
-        if not any(self.root.is_relative_to(project/name) for name in (".private", ".cache")):
-            raise Problem("UNSAFE_PATH", "私人目录必须位于当前项目的私人数据域内")
+        from .paths import private_path
+        private_path(self.root)
         if self.root.is_symlink() or self.root.resolve() != self.root:
             raise Problem("UNSAFE_PATH", "私人目录不能经过符号链接")
         private_mkdir(self.root)

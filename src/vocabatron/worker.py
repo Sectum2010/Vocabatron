@@ -6,7 +6,7 @@ from pathlib import Path
 import resource
 
 
-def preflight(path,limits):
+def preflight(path,limits,page_numbers=None):
     from pypdf import PdfReader
     from .domain import Problem
     reader=PdfReader(path)
@@ -14,7 +14,10 @@ def preflight(path,limits):
     if len(reader.pages)>limits['pages']:raise Problem('RESOURCE_LIMIT','PDF 页数超限')
     if sum(len(v) for v in reader.xref.values())>limits['objects']:raise Problem('RESOURCE_LIMIT','PDF 对象数量超限')
     characters=0
-    for page in reader.pages:
+    if page_numbers is not None and (not isinstance(page_numbers,list) or len(page_numbers)>8 or any(type(p)!=int or not 1<=p<=len(reader.pages) for p in page_numbers)):
+        raise Problem('INPUT_INVALID','Invalid page group')
+    pages=reader.pages if page_numbers is None else [reader.pages[p-1] for p in page_numbers]
+    for page in pages:
         unit=float(page.get('/UserUnit',1))
         if not math.isfinite(unit) or unit<=0:raise Problem('RESOURCE_LIMIT','PDF 页面单位不合法')
         for box in (page.mediabox,page.cropbox):
@@ -29,7 +32,10 @@ def preflight(path,limits):
 def dispatch(op,payload,limits):
     from .domain import FrozenClues,Lesson,Layout,Problem
     for key in ('source','template','output'):
-        if key in payload and Path(payload[key]).is_file():preflight(payload[key],limits)
+        if key in payload and Path(payload[key]).is_file():preflight(payload[key],limits,payload.get('page_numbers') if op=='book_pages' else None)
+    if op=='book_pages':
+        from .app.book import extract_pages
+        return extract_pages(Path(payload['source']),payload['page_numbers'],limits=limits)
     if op=='extract':
         from .ingest import extract_local
         return extract_local(Path(payload['source']),payload['lesson'],limits=limits)
