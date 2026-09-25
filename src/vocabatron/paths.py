@@ -27,6 +27,9 @@ def private_path(path):
 
 def worker_environment():
     code, data, runtime, legacy = roots()
-    return dict(zip(('VOCABATRON_CODE_ROOT', 'VOCABATRON_DATA_ROOT',
+    result=dict(zip(('VOCABATRON_CODE_ROOT', 'VOCABATRON_DATA_ROOT',
                      'VOCABATRON_RUNTIME_ROOT', 'VOCABATRON_LEGACY_ROOT'),
                     map(str, (code, data, runtime, legacy))))
+    if os.environ.get('VOCABATRON_OCR_ROOT'):
+        result['VOCABATRON_OCR_ROOT']=str(private_path(os.environ['VOCABATRON_OCR_ROOT']))
+    return result

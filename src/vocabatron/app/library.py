@@ -10,7 +10,10 @@ from ..domain import Lesson, FrozenClues, Problem, digest
 from ..storage import PrivateStore, sha256
 from .database import Database, encode, one, rows, task_record, insert_task, require_fence
 from .objects import Objects
-from .identity import identities
+from .identity import identities,semantic_content
+from ..documents import PARSER_VERSION
+
+TERMINAL=('COMPLETED','EXHAUSTED','FAILED','NEEDS_ATTENTION','CANCELLED')
 
 MAX_COUNT=9007199254740991  # Exact shared JSON/JavaScript integer representation.
 
@@ -46,6 +49,31 @@ class Library:
 
     def initialize(self):
         self.db.initialize()
+        # Add aliases without rewriting any saved lesson, ID, clue or variant.
+        with self.db.transaction() as c:
+            for row in rows(c,'SELECT id,lesson_json FROM lessons WHERE id NOT IN (SELECT lesson_id FROM semantic_aliases)'):
+                canonical=semantic_content(Lesson.model_validate(self.objects.read_json(row['lesson_json'])))
+                c.execute('INSERT OR IGNORE INTO semantic_aliases VALUES(?,?,?)',(digest(canonical),row['id'],encode(canonical)))
+            for source in rows(c,'SELECT * FROM sources s WHERE report IS NOT NULL AND NOT EXISTS (SELECT 1 FROM source_attempts a WHERE a.source_id=s.id)'):
+                old=one(c,"SELECT id,created FROM tasks WHERE kind='import' AND json_extract(input_json,'$.source_id')=? AND status IN ('COMPLETED','NEEDS_ATTENTION') ORDER BY updated DESC LIMIT 1",(source['id'],))
+                if old:
+                    c.execute('INSERT OR IGNORE INTO source_attempts(task_id,source_id,parser_version,report,created) VALUES(?,?,?,?,?)',
+                        (old['id'],source['id'],source['parser_version'] or 'legacy-unversioned',source['report'],old['created']))
+
+    def retry_parser_upgrades(self):
+        """One new task per source/version; old attempts and reports stay intact."""
+        with self.db.transaction() as c:
+            pending=rows(c,"SELECT * FROM sources WHERE status IN ('NEEDS_ATTENTION','PARTIALLY_IMPORTED') AND COALESCE(parser_version,'')<>?",(PARSER_VERSION,))
+            made=[]
+            for source in pending:
+                if one(c,'SELECT task_id FROM parser_retries WHERE source_id=? AND parser_version=?',(source['id'],PARSER_VERSION)):continue
+                if one(c,"SELECT id FROM tasks WHERE kind='import' AND json_extract(input_json,'$.source_id')=? AND status NOT IN ('COMPLETED','EXHAUSTED','FAILED','NEEDS_ATTENTION','CANCELLED')",(source['id'],)):continue
+                task=task_record('import',{'source_id':source['id'],'parser_version':PARSER_VERSION,'previous_report':source['report']},priority=15)
+                insert_task(c,task)
+                c.execute('INSERT INTO parser_retries VALUES(?,?,?)',(source['id'],PARSER_VERSION,task['id']))
+                c.execute("UPDATE sources SET status='QUEUED',notice_dismissed_at=NULL WHERE id=?",(source['id'],))
+                self.db.event(c,'task',{'id':task['id'],'status':'QUEUED','reason':'Parser upgraded'},task['id']);made.append(task['id'])
+            return made
 
     def source(self,path,name,*,task=True):
         """Input is an already bounded server-owned upload, never a browser path."""
@@ -66,7 +94,7 @@ class Library:
                       (key,reference,name,info.st_size,'QUEUED' if task else 'READY',time.time()))
             result={'source_id':key,'reused':False,'status':'QUEUED' if task else 'READY'}
             if task:
-                record=task_record('import',{'source_id':key},priority=20);insert_task(c,record)
+                record=task_record('import',{'source_id':key,'parser_version':PARSER_VERSION},priority=20);insert_task(c,record)
                 self.db.event(c,'task',{'id':record['id'],'status':'QUEUED'},record['id']);result['task']={'id':record['id'],'status':'QUEUED'}
         return result
 
@@ -80,10 +108,14 @@ class Library:
                  'coverage':coverage_ref,'transcript':transcript_ref,
                  'pages':sorted({f.page for w in lesson.words for f in w.fields}),**(extra_binding or {})}
         def publish(conn):
+            alias=one(conn,'SELECT * FROM semantic_aliases WHERE id=?',(ids['lesson_content_id'],))
+            if alias:
+                if json.loads(alias['canonical'])!=ids['canonical']:raise Problem('CONTENT_HASH_CONFLICT','Semantic identity conflict')
+                ids['lesson_content_id']=alias['lesson_id'];binding['lesson_content_id']=alias['lesson_id']
             conn.execute('INSERT OR IGNORE INTO answer_sets(id) VALUES(?)',(ids['answer_set_id'],))
             conn.execute('INSERT OR IGNORE INTO families VALUES(?,?,?)',(ids['structure_family_id'],ids['answer_set_id'],encode(ids['rules'])))
             existing=one(conn,'SELECT * FROM lessons WHERE id=?',(ids['lesson_content_id'],))
-            if existing and json.loads(existing['canonical'])!=ids['canonical']:
+            if existing and semantic_content(Lesson.model_validate(self.objects.read_json(existing['lesson_json'])))!=ids['canonical']:
                 raise Problem('CONTENT_HASH_CONFLICT','Content identity conflict')
             if not existing:
                 conn.execute('INSERT INTO lessons(id,number,family_id,canonical,lesson_json,source_id,word_count,frozen_ref,created) VALUES(?,?,?,?,?,?,?,?,?)',
@@ -96,6 +128,7 @@ class Library:
                              (encode(frozen_ref),lesson_ref,ids['lesson_content_id']))
             conn.execute('INSERT OR IGNORE INTO source_bindings VALUES(?,?,?,?,?)',
                          (digest(binding),ids['lesson_content_id'],source_id,encode(binding),time.time()))
+            conn.execute('INSERT OR IGNORE INTO semantic_aliases VALUES(?,?,?)',(digest(ids['canonical']),ids['lesson_content_id'],encode(ids['canonical'])))
             return {'lesson_id':ids['lesson_content_id'],'reused':existing is not None,'number':lesson.lesson,'words':len(lesson.words)}
         if c is not None:return publish(c)
         with self.db.transaction() as connection:
@@ -187,15 +220,41 @@ class Library:
         c.execute('UPDATE tasks SET batch_id=? WHERE id=?',(bid,task['id']))
         return one(c,'SELECT * FROM batches WHERE id=?',(bid,))
 
-    def list_tasks(self,offset=0,limit=50):
-        result=self.db.all('SELECT t.*, l.number AS lesson_number FROM tasks t LEFT JOIN lessons l ON l.id=t.lesson_id ORDER BY t.created DESC LIMIT ? OFFSET ?',(limit,offset))
+    def list_tasks(self,offset=0,limit=50,*,history=False):
+        where='' if history else "WHERE t.dismissed_at IS NULL AND NOT (t.kind IN ('migrate','migration') AND t.status='COMPLETED' AND EXISTS (SELECT 1 FROM artifacts a WHERE a.task_id=t.id AND a.state='AVAILABLE') AND NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.task_id=t.id AND a.state<>'AVAILABLE'))"
+        result=self.db.all('SELECT t.*, l.number AS lesson_number FROM tasks t LEFT JOIN lessons l ON l.id=t.lesson_id '+where+' ORDER BY t.created DESC LIMIT ? OFFSET ?',(limit,offset))
         for task in result:
             for key in ('input_json','fence','owner'):task.pop(key,None)
             task['pending_variants']=self.db.one("SELECT COUNT(*) n FROM artifacts WHERE task_id=? AND state!='AVAILABLE'",(task['id'],))['n']
             if task['detail']:
                 try:task['detail']=json.loads(task['detail'])
                 except ValueError:pass
-        return {'items':result,'total':self.db.one('SELECT COUNT(*) n FROM tasks')['n']}
+        return {'items':result,'total':self.db.one('SELECT COUNT(*) n FROM tasks t '+where)['n']}
+
+    def dismiss_tasks(self,task_id=None,*,restore=False):
+        with self.db.transaction() as c:
+            if task_id:
+                task=one(c,'SELECT status FROM tasks WHERE id=?',(task_id,))
+                if not task:raise Problem('NOT_FOUND','Activity not found')
+                if task['status'] not in TERMINAL:raise Problem('ACTIVITY_RUNNING','Only finished activity can be dismissed')
+            statuses=TERMINAL if task_id else ('COMPLETED','EXHAUSTED')
+            sql='UPDATE tasks SET dismissed_at=? WHERE status IN ('+','.join('?' for _ in statuses)+')'
+            args=[None if restore else time.time(),*statuses]
+            if task_id:sql+=' AND id=?';args.append(task_id)
+            c.execute(sql,args);self.db.event(c,'task',{'dismissed':not restore,'id':task_id})
+        return {'saved':True}
+
+    def dismiss_source(self,source_id,*,restore=False):
+        with self.db.transaction() as c:
+            source=one(c,'SELECT status FROM sources WHERE id=?',(source_id,))
+            if not source:raise Problem('NOT_FOUND','Source not found')
+            if source['status'] not in ('READY','PARTIALLY_IMPORTED','NEEDS_ATTENTION','FAILED','CANCELLED','RECOVERY_UNAVAILABLE'):
+                raise Problem('IMPORT_RUNNING','Only finished import notices can be dismissed')
+            if one(c,"SELECT id FROM tasks WHERE kind='import' AND json_extract(input_json,'$.source_id')=? AND status NOT IN ('COMPLETED','EXHAUSTED','FAILED','NEEDS_ATTENTION','CANCELLED')",(source_id,)):
+                raise Problem('IMPORT_RUNNING','This import is still active')
+            c.execute('UPDATE sources SET notice_dismissed_at=? WHERE id=?',(None if restore else time.time(),source_id))
+            self.db.event(c,'library',{'source_id':source_id,'notice_dismissed':not restore})
+        return {'saved':True}
 
     def control(self,task_id,action):
         if action not in ('pause','resume','cancel','retry'):raise Problem('INPUT_INVALID','Unknown task action')
@@ -203,6 +262,16 @@ class Library:
             task=one(c,'SELECT * FROM tasks WHERE id=?',(task_id,))
             if not task:raise Problem('NOT_FOUND','Task not found')
             if task['status'] in ('COMPLETED','EXHAUSTED'):return {'id':task_id,'status':task['status']}
+            if action=='retry' and task['kind']=='import' and task['status'] in ('FAILED','NEEDS_ATTENTION'):
+                source_id=json.loads(task['input_json'])['source_id']
+                source=one(c,'SELECT report FROM sources WHERE id=?',(source_id,))
+                active=one(c,"SELECT id,status FROM tasks WHERE kind='import' AND json_extract(input_json,'$.source_id')=? AND status NOT IN ('COMPLETED','EXHAUSTED','FAILED','NEEDS_ATTENTION','CANCELLED')",(source_id,))
+                if active:return active
+                new=task_record('import',{'source_id':source_id,'parser_version':PARSER_VERSION,'previous_report':source['report']},priority=15)
+                insert_task(c,new)
+                c.execute("UPDATE sources SET status='QUEUED',notice_dismissed_at=NULL WHERE id=?",(source_id,))
+                self.db.event(c,'task',{'id':new['id'],'status':'QUEUED','retry_of':task_id},new['id'])
+                return {'id':new['id'],'status':'QUEUED','intent':'run'}
             if action in ('resume','retry'):
                 if task['status']=='RUNNING':return {'id':task_id,'status':'RUNNING'}
                 if task['status']=='CANCELLED':raise Problem('TASK_CANCELLED','Create a new request to generate further variants')

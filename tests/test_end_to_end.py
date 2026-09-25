@@ -16,9 +16,14 @@ def test_normal_pipeline_without_supplied_layout(tmp_path,count,monkeypatch):
     s=PrivateStore(tmp_path/'store');s.path('sources').mkdir()
     synthetic_course(s.path('sources/input.pdf'),[w.raw for w in witness_lesson.words])
     synthetic_template(s.path('sources/template.pdf'))
+    # This dense, nearly full-board case validates correctness, not a latency
+    # SLA. Idle-priority CPU scheduling can exhaust the former 90 s allowance.
+    # Keep a finite integration budget without weakening any output checks or
+    # changing the production search slice.
+    search_seconds=240 if count==39 else 90
     s.json('config.json',{'lesson':3,'source':'sources/input.pdf','template':'sources/template.pdf',
         'prefixes':['VersionA','VersionB'],'expected_words':count,
-        'solver':{'seconds_per_layout':90,'optimization_seconds':0,'workers':4}})
+        'solver':{'seconds_per_layout':search_seconds,'optimization_seconds':0,'workers':4}})
     assert services.import_lesson(s)['words']==count
     adapter,_=transport();services.select_clues(s,adapter=adapter)
     config,lesson,frozen=services.load_inputs(s)

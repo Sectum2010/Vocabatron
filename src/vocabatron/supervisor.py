@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import psutil
 
 from pydantic import Field
 from .domain import Record, Problem
@@ -77,7 +78,7 @@ def run_job(operation, payload, *, limits=None, cancel=None):
     job=Path(tempfile.mkdtemp(prefix='job-',dir=root));job.chmod(0o700)
     owner_fd=os.open(job/'owner.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
     with os.fdopen(owner_fd,'w') as marker:json.dump({'format':'vocabatron-resource-job-v1','owner':owner_identity()},marker)
-    proc=None;started=time.monotonic();streams=bytearray();error=None
+    proc=None;started=time.monotonic();streams=bytearray();error=None;sampled=0;peak_rss=0
     try:
         payload=dict(payload);delivery=None;preview_delivery=None
         for key in ('source','template','output'):
@@ -122,6 +123,15 @@ def run_job(operation, payload, *, limits=None, cancel=None):
                 checkpoint()
                 if cancel and cancel():raise Problem('CANCELLED','受监督任务已取消')
                 if time.monotonic()-started>limits.wall_seconds:raise Problem('RESOURCE_LIMIT','子进程墙钟时间超限')
+                if time.monotonic()-sampled>.2:
+                    sampled=time.monotonic();rss=0
+                    try:
+                        parent=psutil.Process(proc.pid)
+                        for child in [parent,*parent.children(recursive=True)]:
+                            with contextlib.suppress(psutil.NoSuchProcess):rss+=child.memory_info().rss
+                    except psutil.NoSuchProcess:pass
+                    peak_rss=max(peak_rss,rss)
+                    if rss>limits.rss_bytes:raise Problem('RESOURCE_LIMIT','Document process tree exceeded its resident memory budget')
                 total=sum(p.lstat().st_size for p in job.rglob('*') if p.is_file() and not p.is_symlink())
                 if total>limits.temporary_bytes:raise Problem('RESOURCE_LIMIT','任务临时文件总量超限')
                 for key,_ in selector.select(.04):
@@ -141,6 +151,8 @@ def run_job(operation, payload, *, limits=None, cancel=None):
         if response.stat().st_size>limits.ipc_bytes:raise Problem('RESOURCE_LIMIT','子进程响应超限')
         result=json.loads(response.read_bytes())
         if not isinstance(result,dict) or set(result)-{'ok','result','code','metrics','error_details'}:raise Problem('WORKER_FAILED','子进程响应格式错误')
+        if not isinstance(result.setdefault('metrics',{}),dict):raise Problem('WORKER_FAILED','Invalid worker metrics')
+        result['metrics']['observed_tree_peak_rss_bytes']=peak_rss
         if result.get('ok') is not True:
             if preview_delivery and (job/'previews').is_dir():
                 from .storage import private_mkdir

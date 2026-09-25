@@ -38,7 +38,8 @@ def test_continuation_missing_page_and_nontext_content(library):
     source=root/'continued.pdf';synthetic_course(source,['AB','AC','AD','AE','AF','AG','AH','AI','AJ'],3)
     result=extract(source)
     # A continuation does not depend on the presence of a repeated heading.
-    result['pages'][1]['events']=[e for e in result['pages'][1]['events'] if e['type']!='title']
+    for e in result['pages'][1]['events']:
+        if e['type']=='title':e['type']='metadata'
     book=assemble(result['source_sha256'],result['pages']);assert book['status']=='READY'
     assert len(book['lessons'][0]['lesson']['words'])==9
     missing=assemble(result['source_sha256'],result['pages'][:1],total_pages=2)

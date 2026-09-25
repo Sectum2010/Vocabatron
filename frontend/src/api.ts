@@ -23,5 +23,5 @@ export function upload(files:File[],progress:(sent:number,total:number)=>void):P
 }
 export type Lesson={id:string;number:number;display_name:string|null;archived:number;word_count:number;variants:number;status:string;content_short_id:string;sources:{name:string;pages:number[]}[]};
 export type Artifact={id:string;filename:string;variant_number:number;batch_number:number;crossing_count:number;pages:number;bytes:number;export_status:string;state:string};
-export type Task={id:string;kind:string;lesson_id:string;lesson_number:number|null;status:string;stage:string;completed:number;target_type:string;target_count:number|null;pending_variants:number;detail:any;intent:string};
+export type Task={id:string;kind:string;lesson_id:string;lesson_number:number|null;status:string;stage:string;completed:number;target_type:string;target_count:number|null;pending_variants:number;detail:any;intent:string;dismissed_at:number|null};
 export type Prefs={version:number;default_count:number;theme:'system'|'light'|'dark';background_prepare:boolean;search_slots:number;threads_per_search:number;document_slots:number};

@@ -35,6 +35,9 @@ CREATE TABLE IF NOT EXISTS resource_samples(id INTEGER PRIMARY KEY AUTOINCREMENT
 CREATE TABLE IF NOT EXISTS holds(id TEXT PRIMARY KEY, until REAL NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS migrations(id TEXT PRIMARY KEY, source TEXT NOT NULL, evidence TEXT NOT NULL, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS task_checkpoints(task_id TEXT PRIMARY KEY REFERENCES tasks(id), value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS semantic_aliases(id TEXT PRIMARY KEY, lesson_id TEXT NOT NULL REFERENCES lessons(id), canonical TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS source_attempts(task_id TEXT PRIMARY KEY REFERENCES tasks(id), source_id TEXT NOT NULL REFERENCES sources(id), parser_version TEXT NOT NULL, previous_report TEXT, report TEXT, timings TEXT, created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS parser_retries(source_id TEXT NOT NULL REFERENCES sources(id), parser_version TEXT NOT NULL, task_id TEXT NOT NULL REFERENCES tasks(id), PRIMARY KEY(source_id,parser_version));
 """
 
 def encode(value):
@@ -67,7 +70,14 @@ class Database:
             if str(mode).lower()!='wal': raise Problem('DATABASE_WAL_REQUIRED','WAL could not be enabled')
             with c:
                 c.execute(SCHEMA)
+                for table,columns in {'tasks':{'dismissed_at':'REAL','started_at':'REAL','yield_requested':'TEXT',
+                                      'resource_wait_started':'REAL','resource_wait_seconds':'REAL NOT NULL DEFAULT 0','queue_wait_seconds':'REAL'},
+                                      'sources':{'notice_dismissed_at':'REAL','parser_version':'TEXT'}}.items():
+                    existing={row['name'] for row in rows(c,'PRAGMA table_info('+table+')')}
+                    for name,kind in columns.items():
+                        if name not in existing:c.execute('ALTER TABLE '+table+' ADD COLUMN '+name+' '+kind)
                 c.execute('INSERT OR IGNORE INTO schema_versions VALUES(1,?)',(time.time(),))
+                c.execute('INSERT OR IGNORE INTO schema_versions VALUES(2,?)',(time.time(),))
                 c.execute('INSERT OR IGNORE INTO preferences VALUES(1,1,?)', (encode({
                     'default_count':2,'theme':'system','background_prepare':False,
                     'search_slots':1,'threads_per_search':2,'document_slots':1}),))

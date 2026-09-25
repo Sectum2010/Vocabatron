@@ -7,9 +7,27 @@ RULES = {'grid': 20, 'alphabet': 'A-Z', 'forward_only': True, 'all_answers_once'
          'maximal_runs_only': True, 'connected_crossings': True, 'parallel_overlap': False}
 DEDUPE_VERSION = 'letter-owner-dihedral-and-crossings-v1'
 CONTENT_VERSION = 'ordered-source-fields-v1'
+SEMANTIC_VERSION = 'ordered-vocabulary-semantics-v2'
 
 
-def canonical_content(lesson):
+def semantic_content(lesson):
+    """Text meaning and exact spelling, independent of boxes, wraps and backend.
+
+    Original fields, separators and invisible controls remain in the immutable
+    source binding; this key does not replace legacy IDs or frozen evidence.
+    """
+    from ..documents import visible
+    def text(value):return whitespace(visible(value))
+    def fragments(values):return text(' '.join(f.raw for f in values))
+    return {'version':SEMANTIC_VERSION,'lesson':lesson.lesson,'words':[
+        {'raw':text(w.raw),'letters':w.letters,'part_of_speech':text(w.part_of_speech),
+         'pronunciation':''.join(fragments(w.pronunciation).split()),
+         **{key:fragments(getattr(w,key)) for key in ('forms','definition','examples')},
+         'candidates':{relation:[text(c.text) for c in w.candidates if c.relation==relation]
+                       for relation in ('SYNONYM','ANTONYM')}} for w in lesson.words]}
+
+
+def legacy_content(lesson):
     def fragments(values): return [whitespace(f.raw) for f in values]
     return {'version': CONTENT_VERSION, 'lesson': lesson.lesson, 'words': [
         {'ordinal': w.ordinal, 'raw': whitespace(w.raw), 'letters': w.letters,
@@ -18,6 +36,13 @@ def canonical_content(lesson):
          'candidates': [{'relation': c.relation, 'text': whitespace(c.text), 'segment': c.segment,
                          'source_label_and_text': whitespace(c.source.raw)} for c in w.candidates]}
         for w in lesson.words]}
+
+
+canonical_content=semantic_content
+
+
+def content_matches(lesson,content_id):
+    return content_id in (digest(semantic_content(lesson)),digest(legacy_content(lesson)))
 
 
 def identities(lesson, size=20):

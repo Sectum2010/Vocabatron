@@ -33,7 +33,7 @@ def run_slices(library,tid,limit=40):
         with library.db.transaction() as c:c.execute("UPDATE tasks SET status='RUNNING',intent='run',fence=? WHERE id=?",(fence,tid))
         outcome=Job(library,tid,fence).run()['status']
         with library.db.transaction() as c:c.execute('UPDATE tasks SET status=? WHERE id=?',(outcome,tid))
-        if outcome in ('COMPLETED','EXHAUSTED'):return outcome
+        if outcome in ('COMPLETED','EXHAUSTED','FAILED','NEEDS_ATTENTION','CANCELLED'):return outcome
     pytest.fail('Bounded synthetic queue failed to finish')
 
 

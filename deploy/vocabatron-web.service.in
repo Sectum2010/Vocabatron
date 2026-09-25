@@ -24,7 +24,6 @@ Nice=19
 CPUSchedulingPolicy=idle
 IOSchedulingClass=idle
 CPUWeight=idle
-CPUQuota=20%
 MemoryHigh=384M
 MemoryMax=512M
 MemorySwapMax=0

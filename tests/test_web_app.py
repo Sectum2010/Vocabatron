@@ -178,14 +178,15 @@ def test_cpu_only_development_uses_host_headroom_and_keeps_other_guards():
     authorized=policy.model_copy(update={'cpu_work_during_gpu_activity':True})
     assert pressure_reason(sample,authorized) is None
     assert pressure_reason(sample,authorized,inference=True)
-    assert pressure_reason(sample,ResourcePolicy(),cpu_only=True)
+    assert pressure_reason(sample,ResourcePolicy(),cpu_only=True) is None
     sample['external_cpu_percent']=70
     assert pressure_reason(sample,policy,cpu_only=True,running=True)
     sample['external_cpu_percent']=12
     sample['pressure']['cpu']['some']['avg10']=8
     assert pressure_reason(sample,policy,cpu_only=True,running=True) is None
     sample['external_cpu_percent']=35
-    assert pressure_reason(sample,policy,cpu_only=True,running=True)
+    assert pressure_reason(sample,policy,cpu_only=True,running=True) is None
+    assert pressure_reason(sample,policy,cpu_only=True)  # New work waits; current bounded work is retained.
     sample['external_cpu_percent']=12
     sample['pressure']['memory']['some']['avg10']=1
     assert pressure_reason(sample,policy,cpu_only=True,running=True)

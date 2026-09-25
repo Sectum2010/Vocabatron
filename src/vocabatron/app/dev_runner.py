@@ -18,8 +18,9 @@ from .resources import Telemetry,pressure_reason,idle_priority
 class CpuDevelopmentPolicy(ResourcePolicy):
     """Bounded, explicitly authorized CPU testing can use host spare capacity.
 
-    Percentages are of the whole host. At most four CPUs are available to the
-    command through affinity; CPU, memory and I/O pressure still trigger yield.
+    Percentages are of the whole host. A bounded affinity budget is available;
+    memory pressure triggers yield, while transient CPU/I/O stalls do not discard
+    a running regression. New commands still wait for quiet admission.
     Production and inference admission keep their separately configured policy.
     """
     external_cpu_start_percent: float = Field(default=50,gt=0,le=50)
@@ -36,12 +37,18 @@ def sample_summary(sample):
             'pressure':{k:(v or {}).get('some',{}).get('avg10') for k,v in sample.get('pressure',{}).items()}}
 
 
+def stop_owned_group(process):
+    """The wrapper can exit before signal-aware children; stop its whole group."""
+    with contextlib.suppress(ProcessLookupError):os.killpg(process.pid,signal.SIGKILL)
+    process.wait()
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--max-seconds',type=int,default=1800)
     parser.add_argument('--idle-seconds',type=float,default=20)
     parser.add_argument('--cpu-only',action='store_true',help='Explicitly authorized CPU-only testing while unrelated GPU work continues')
-    parser.add_argument('--cpu-budget',type=int,choices=(1,2,3,4),default=2)
+    parser.add_argument('--cpu-budget',type=int,choices=range(1,9),default=4)
     parser.add_argument('command',nargs=argparse.REMAINDER)
     args=parser.parse_args();command=args.command
     if command and command[0]=='--':command=command[1:]
@@ -66,7 +73,8 @@ def main():
             'external_cpu_stop_percent':max(0,min(65,85-100*args.cpu_budget/host_count))})
     deadline=time.monotonic()+args.max_seconds;quiet=None;process=None;last_reason=None
     stopping=False;stop_at=0;attempts=0;last_report=0;cpu_busy_since=None
-    lock_path=Path.cwd()/'.cache'/'development.lock';lock_path.parent.mkdir(mode=0o700,exist_ok=True)
+    project_root=Path(__file__).resolve().parents[3]
+    lock_path=project_root/'.cache'/'development.lock';lock_path.parent.mkdir(mode=0o700,exist_ok=True)
     lock=os.open(lock_path,os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
     # Development commands share one affinity budget and serialize heavy
     # work. Independent build/test launches cannot bypass the global budget.
@@ -77,8 +85,7 @@ def main():
             time.sleep(1)
     def cleanup(*_):
         if process is not None:
-            with contextlib.suppress(ProcessLookupError):os.killpg(process.pid,signal.SIGKILL)
-            process.wait()
+            stop_owned_group(process)
         os.close(lock)
         raise SystemExit(130)
     for sig in (signal.SIGINT,signal.SIGTERM):signal.signal(sig,cleanup)
@@ -109,6 +116,7 @@ def main():
             result=process.poll()
             if result is not None:
                 process.wait()
+                stop_owned_group(process)
                 if not stopping:return result
                 print(json.dumps({'development_guard':'YIELDED','response_seconds':time.monotonic()-stop_at}),flush=True)
                 process=None;stopping=False;quiet=None
@@ -123,8 +131,7 @@ def main():
             process=subprocess.Popen(command,start_new_session=True,stdin=subprocess.DEVNULL)
         time.sleep(1)
     if process is not None:
-        with contextlib.suppress(ProcessLookupError):os.killpg(process.pid,signal.SIGKILL)
-        process.wait()
+        stop_owned_group(process)
     print(json.dumps({'development_guard':'WAIT_TIMEOUT','not_an_application_test_failure':True}),flush=True)
     return 75
 

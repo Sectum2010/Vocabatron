@@ -49,6 +49,34 @@ def history_hint(lesson,size,history,seconds,seed):
 def next_structure(lesson, frozen, profile, history, rejections, *, seconds=90, threads=1, seed=37,
                    size=20, cancel=None, rejected=None, stage=None):
     stage=stage or (lambda *args:None)
+    stage('Finding a new arrangement')
+    previous=restore_layout(lesson,history[-1]['layout']) if history else None
+    hint,hint_metrics=history_hint(lesson,size,history,min(2,seconds/10),seed) if history else (None,{})
+    if hint is None:
+        hint,hint_metrics=warm_hint(lesson,size,seed,seconds=min(6,seconds/5),exclude=previous)
+    # A complete candidate can be proved valid directly. CP-SAT presolve used
+    # to spend several seconds rediscovering an already complete legal hint.
+    # This path proves only this candidate; exhaustion still requires the
+    # unchanged complete residual CP-SAT model below.
+    if hint is not None and len(hint.placements)==len(lesson.words):
+        try:
+            candidate=structure(lesson,hint)
+            unseen=not any(candidate['crossing_hash']==old['crossing_hash'] or candidate['geometry_hash']==old['geometry_hash'] for old in history)
+            rejected_layouts={digest(item['layout']) for item in rejections}
+            if unseen and digest(candidate['layout']) not in rejected_layouts:
+                plan(lesson,hint,frozen,profile)
+                checkpoint()
+                if cancel and cancel():raise Problem('CANCELLED','Search stopped')
+                return hint,{'status':'VERIFIED_CANDIDATE','solver_called':False,
+                    'rules':{**RULES,'grid':size},'dedupe_version':DEDUPE_VERSION,
+                    'history_hash':digest(history),'rejection_hash':digest(rejections),'hint':hint_metrics,
+                    'parameters':{'threads':threads,'seconds':seconds,'seed':seed},
+                    'proof_kind':'independent layout, complete history and typography validation; no exhaustion conclusion'}
+        except Problem as exc:
+            if exc.code in ('CANCELLED','PAUSED_BY_USER','PAUSED_FOR_RESOURCES','ATTEMPT_EXPIRED'):raise
+            # Invalid/overflowing hints are optional hints, never proof of
+            # impossibility. The exact model keeps its full solution domain.
+            hint=None
     stage('Building crossword model')
     costs,capacities=clue_capacity(lesson,frozen,profile)
     model=ExactModel(lesson,size,costs,capacities,check_graph=False)
@@ -56,13 +84,7 @@ def next_structure(lesson, frozen, profile, history, rejections, *, seconds=90, 
         model.exclude_fingerprint(restore_crossings(lesson,item['crossings']))
         model.exclude_geometry(restore_layout(lesson,item['layout']))
     for item in rejections:model.exclude_layout(restore_layout(lesson,item['layout']))
-    stage('Finding a new arrangement')
-    previous=restore_layout(lesson,history[-1]['layout']) if history else None
-    hint,hint_metrics=history_hint(lesson,size,history,min(2,seconds/10),seed) if history else (None,{})
-    if hint is None:
-        hint,hint_metrics=warm_hint(lesson,size,seed,seconds=min(6,seconds/5),exclude=previous)
-    model.hint(hint)
-    deadline=time.monotonic()+seconds
+    model.hint(hint);deadline=time.monotonic()+seconds
     evidence={'rules':{**RULES,'grid':size},'dedupe_version':DEDUPE_VERSION,
               'solver_version':importlib.metadata.version('ortools'),
               'parameters':{'threads':threads,'seconds':seconds,'seed':seed},

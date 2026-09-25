@@ -8,6 +8,11 @@ version = "0.3.0"
 description = "Local, source-faithful crossword generation and independent PDF verification"
 requires-python = ">=3.12,<3.14"
 dependencies = [
+  "docling-slim[convert-core,format-pdf,models-local,feat-ocr-rapidocr-onnx]==2.130.0",
+  "torch==2.14.0+cpu",
+  "torchvision==0.29.0+cpu",
+  "rapidocr==3.9.2",
+  "onnxruntime==1.30.0",
   "ortools>=9.12,<10",
   "pdfplumber>=0.11,<0.12",
   "pypdf>=6,<7",
@@ -46,3 +51,11 @@ exclude = ["/frontend/node_modules", "/frontend/dist", "/frontend/test-results",
 testpaths = ["tests"]
 addopts = "-q --basetemp=.cache/pytest"
 markers = ["private: explicitly enabled real local integration"]
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

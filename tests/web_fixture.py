@@ -30,11 +30,13 @@ def main():
     root=Path(tempfile.mkdtemp(prefix='invented-',dir=parent));data=root/'private';template=root/'template.pdf'
     synthetic_template(template);source=root/'Invented lesson.pdf';synthetic_course(source,['AB','AC'],3)
     config=AppConfig(code_root=project,data_root=data,runtime_root=data/'runtime',database=data/'database.sqlite3',
-        outputs_root=root/'Outputs',static_root=project/'frontend/dist',legacy_root=root/'legacy',template=template,
+        outputs_root=root/'Outputs',static_root=project/'.cache/frontend-dist',legacy_root=root/'legacy',template=template,
         public_base_url='https://127.0.0.1:18766/vocabatron/',listen_port=18766,
         allowed_logins=('owner@example.test','other@example.test'),csrf_secret=secrets.token_hex(32))
     config.activate();library=Library(config);library.initialize();config.outputs_root.mkdir()
     task=library.source(source,source.name)['task'];assert run_slices(library,task['id'])=='COMPLETED'
+    unresolved=root/'Unresolved invented.pdf';synthetic_course(unresolved,['AB','AB'],4)
+    notice=library.source(unresolved,unresolved.name)['task'];assert run_slices(library,notice['id'])=='NEEDS_ATTENTION'
     row=library.db.one('SELECT * FROM lessons');lid=row['id'];row,lesson=library.lesson(lid)
     adapter,_=transport();frozen=select(lesson,adapter,PrivateStore(data/'core'))
     reference={'object':library.objects.put_json(frozen.model_dump(mode='json')),'lesson_object':row['lesson_json']}

@@ -1,15 +1,11 @@
 """Descriptor-relative, no-overwrite PDF copies. Outputs is never the archive."""
 from __future__ import annotations
-import ctypes
-import errno
 import hashlib
 import os
 from pathlib import Path
 import stat
-import tempfile
 import time
 from ..domain import Problem
-from ..storage import fsync_dir,private_mkdir
 
 def open_directory(path):
     """Open every component without following a swapped parent symlink."""
@@ -32,7 +28,7 @@ def copy_export(library,artifact):
     if Path(directory).name!=directory or Path(filename).name!=filename or not filename.endswith('.pdf'):
         raise Problem('UNSAFE_PATH','Invalid server-generated export name')
     # The configured root is created administratively, after ignore verification.
-    root_fd=open_directory(config.outputs_root);dest_fd=None;temporary=None
+    root_fd=open_directory(config.outputs_root);dest_fd=None;out_fd=None
     try:
         try:os.mkdir(directory,mode=0o700,dir_fd=root_fd)
         except FileExistsError:pass
@@ -49,26 +45,26 @@ def copy_export(library,artifact):
                 if h.hexdigest()!=artifact['sha256']:raise Problem('EXPORT_CONFLICT','An existing export has different bytes. It was not overwritten.')
                 return {'status':'AVAILABLE','reused':True,'directory':directory,'filename':filename}
             finally:os.close(existing)
-        private_mkdir(config.runtime_root/'exports')
-        out_fd,temporary=tempfile.mkstemp(prefix='export-',dir=config.runtime_root/'exports')
-        if os.fstat(out_fd).st_dev!=os.fstat(dest_fd).st_dev:
-            os.close(out_fd);raise Problem('EXPORT_FILESYSTEM','Private staging and Outputs must share a filesystem for atomic publication')
+        # Separate systemd ReadWritePaths are distinct mount points even when
+        # st_dev matches. Stage an anonymous, private inode on the destination
+        # mount: Outputs never exposes an incomplete PDF or temporary filename.
+        out_fd=os.open('.',os.O_TMPFILE|os.O_RDWR,0o600,dir_fd=dest_fd)
         source=library.objects.open_verified(artifact['path'],artifact['sha256'])
         try:
             h=hashlib.sha256()
-            with os.fdopen(out_fd,'wb') as out:
+            with os.fdopen(out_fd,'wb',closefd=False) as out:
                 while chunk:=os.read(source,1024*1024):out.write(chunk);h.update(chunk)
                 out.flush();os.fsync(out.fileno())
             if h.hexdigest()!=artifact['sha256']:raise Problem('ARTIFACT_CHANGED','Export copy hash mismatch')
         finally:os.close(source)
-        # Linux renameat2 NOREPLACE gives a single, atomic no-overwrite boundary.
-        libc=ctypes.CDLL(None,use_errno=True)
-        result=libc.renameat2(-100,os.fsencode(temporary),dest_fd,os.fsencode(filename),1)
-        if result:
-            number=ctypes.get_errno()
-            if number==errno.EEXIST:raise Problem('EXPORT_CONFLICT','An export appeared during publication; no file was overwritten')
-            raise OSError(number,os.strerror(number))
-        temporary=None;os.fsync(dest_fd);os.fsync(root_fd)
+        # linkat follows only our own open descriptor and atomically creates a
+        # new name without overwriting. Unlike AT_EMPTY_PATH, this needs no
+        # capabilities and works under the deployed NoNewPrivileges policy.
+        # The linked inode is the verified copy, never the archived original.
+        try:os.link(f'/proc/self/fd/{out_fd}',filename,dst_dir_fd=dest_fd,follow_symlinks=True)
+        except FileExistsError:
+            raise Problem('EXPORT_CONFLICT','An export appeared during publication; no file was overwritten')
+        os.fsync(dest_fd);os.fsync(root_fd)
         # Directory replacement cannot redirect the open descriptors outside
         # their anchored inode. Detect a removed/replaced pathname for recovery.
         current=open_directory(config.outputs_root/directory)
@@ -78,9 +74,7 @@ def copy_export(library,artifact):
         finally:os.close(current)
         return {'status':'AVAILABLE','reused':False,'directory':directory,'filename':filename}
     finally:
-        if temporary is not None:
-            try:os.unlink(temporary)
-            except FileNotFoundError:pass
+        if out_fd is not None:os.close(out_fd)
         if dest_fd is not None:os.close(dest_fd)
         os.close(root_fd)
 

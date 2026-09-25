@@ -43,6 +43,47 @@ def test_export_independent_copy_conflict_deletion_and_symlink(library):
     assert restore_one(library,saved)['status']=='CONFLICT'
 
 
+def test_export_stays_anonymous_until_verified_atomic_publication(library,monkeypatch):
+    saved,raw=artifact(library);link=os.link;observed=[]
+    def publish(source,destination,*,dst_dir_fd,follow_symlinks):
+        descriptor=int(source.rsplit('/',1)[1]);info=os.fstat(descriptor)
+        assert info.st_nlink==0 and info.st_mode & 0o777==0o600
+        assert os.listdir(dst_dir_fd)==[]
+        assert os.pread(descriptor,len(raw),0)==raw
+        assert not (library.config.runtime_root/'exports').exists()
+        observed.append(descriptor)
+        return link(source,destination,dst_dir_fd=dst_dir_fd,follow_symlinks=follow_symlinks)
+    monkeypatch.setattr(os,'link',publish)
+    result=restore_one(library,saved);assert result['status']=='AVAILABLE',result
+    path=library.config.outputs_root/result['directory']/result['filename']
+    assert path.read_bytes()==raw and path.stat().st_nlink==1 and len(observed)==1
+    with pytest.raises(OSError):os.fstat(observed[0])
+
+
+def test_export_atomic_publication_preserves_racing_destination(library,monkeypatch):
+    saved,raw=artifact(library);link=os.link
+    def raced(source,destination,*,dst_dir_fd,follow_symlinks):
+        descriptor=os.open(destination,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600,dir_fd=dst_dir_fd)
+        try:os.write(descriptor,b'An independently created export')
+        finally:os.close(descriptor)
+        return link(source,destination,dst_dir_fd=dst_dir_fd,follow_symlinks=follow_symlinks)
+    monkeypatch.setattr(os,'link',raced)
+    result=restore_one(library,saved);assert result['status']=='CONFLICT',result
+    files=list(library.config.outputs_root.rglob('*'))
+    assert len(files)==2 and files[1].read_bytes()==b'An independently created export'
+    assert library.objects.path(saved['path']).read_bytes()==raw
+
+
+def test_export_copy_failure_removes_anonymous_partial_bytes(library,monkeypatch):
+    saved,raw=artifact(library)
+    def interrupted(*_args,**_kwargs):raise OSError('Synthetic interrupted source read')
+    monkeypatch.setattr(library.objects,'open_verified',interrupted)
+    result=restore_one(library,saved);assert result['status']=='FAILED_RETRYABLE',result
+    assert not list(library.config.outputs_root.rglob('*.pdf'))
+    assert all(p.is_dir() for p in library.config.outputs_root.rglob('*'))
+    assert library.objects.path(saved['path']).read_bytes()==raw
+
+
 def test_pdf_range_head_private_and_no_render(library,monkeypatch):
     saved,raw=artifact(library)
     def forbid(*_args,**_kwargs):raise AssertionError('Reading a saved PDF must not parse, render or solve')
@@ -140,7 +181,29 @@ def test_unknown_is_never_exhaustion(library,monkeypatch):
     lesson=lesson_of(['AB','AC']);profile=calibrate(template)
     def unknown(*args,**kwargs):raise Problem('UNKNOWN','Synthetic interrupted search')
     monkeypatch.setattr(search.ExactModel,'solve',unknown)
+    monkeypatch.setattr(search,'warm_hint',lambda *args,**kwargs:(None,{'complete':False}))
     with pytest.raises(Problem,match='UNKNOWN') as caught:next_structure(lesson,frozen_for(lesson),profile,[],[],seconds=1,size=3)
     assert caught.value.details['status']=='UNKNOWN'
     assert caught.value.details['parameters']['seconds']==1
     assert caught.value.details['history_hash'] and caught.value.details['model']['placements']>0
+
+
+def test_complete_hint_requires_independent_validation_and_full_history(library,monkeypatch):
+    from vocabatron.app import search
+    from vocabatron.pdf import calibrate
+    root=library.config.runtime_root;root.mkdir(parents=True,exist_ok=True)
+    template=root/'hint-template.pdf';synthetic_template(template);profile=calibrate(template)
+    lesson=lesson_of(['AB','AC']);frozen=frozen_for(lesson)
+    good=Layout(lesson_version=lesson.version,size=3,placements=(
+        Placement(word_id=lesson.words[0].word_id,row=0,col=0,direction='across'),
+        Placement(word_id=lesson.words[1].word_id,row=0,col=0,direction='down')))
+    monkeypatch.setattr(search,'warm_hint',lambda *args,**kwargs:(good,{'complete':True}))
+    monkeypatch.setattr(search,'history_hint',lambda *args,**kwargs:(good,{'complete':True}))
+    result,proof=next_structure(lesson,frozen,profile,[],[],seconds=3,size=3)
+    assert result==good and proof['status']=='VERIFIED_CANDIDATE' and not proof['solver_called']
+    result,proof=next_structure(lesson,frozen,profile,[structure(lesson,good)],[],seconds=3,size=3)
+    assert result is None and proof['status']=='INFEASIBLE'
+    invalid=good.model_copy(update={'placements':(good.placements[0],good.placements[1].model_copy(update={'direction':'across'}))})
+    monkeypatch.setattr(search,'warm_hint',lambda *args,**kwargs:(invalid,{'complete':True}))
+    result,proof=next_structure(lesson,frozen,profile,[],[],seconds=3,size=3)
+    assert result is not None and result!=invalid and proof['status']!='VERIFIED_CANDIDATE'

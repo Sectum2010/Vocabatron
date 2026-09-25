@@ -15,7 +15,7 @@ from ..evidence import verify_evidence
 from .archive import Archive,delivery_id
 from .book import assemble
 from .database import require_fence,one,rows,encode,insert_task,task_record
-from .identity import identities,structure
+from .identity import identities,structure,content_matches
 from .resources import pressure_reason
 from .search import next_structure
 from .exports import restore_one
@@ -82,6 +82,8 @@ class Job:
             require_fence(c,self.task_id,self.fence)
             c.execute('INSERT INTO task_checkpoints VALUES(?,?) ON CONFLICT(task_id) DO UPDATE SET value=excluded.value',
                       (self.task_id,encode(self.saved)))
+            task=one(c,'SELECT yield_requested FROM tasks WHERE id=?',(self.task_id,))
+        if task['yield_requested']:raise Problem('PAUSED_FOR_RESOURCES',task['yield_requested'])
 
     def run(self):
         started=time.perf_counter()
@@ -100,51 +102,8 @@ class Job:
                 'document_workers':context.subprocesses}
 
     def import_document(self):
-        source=self.db.one('SELECT * FROM sources WHERE id=?',(self.inputs['source_id'],))
-        self.context.emit('Checking document')
-        path=self.library.objects.path(source['path'])
-        if sha256(path)!=source['id']:raise Problem('SOURCE_CHANGED','The uploaded source changed')
-        if 'document_info' not in self.saved:
-            self.save(document_info=run_job('inspect',{'source':str(path)}))
-        count=self.saved['document_info']['pages'];chunks=self.saved.get('page_chunks',[])
-        done=sum(len(self.library.objects.read_json(ref)['pages']) for ref in chunks)
-        while done<count:
-            numbers=list(range(done+1,min(done+8,count)+1))
-            self.context.emit('Extracting text',{'pages_done':done,'pages_total':count})
-            result=run_job('book_pages',{'source':str(path),'page_numbers':numbers})
-            if result['source_sha256']!=source['id']:raise Problem('SOURCE_CHANGED','Extraction source mismatch')
-            chunks.append(self.library.objects.put_json(result));self.save(page_chunks=chunks)
-            done+=len(numbers)
-        self.context.emit('Detecting lessons',{'pages_done':count,'pages_total':count})
-        pages=[page for ref in chunks for page in self.library.objects.read_json(ref)['pages']]
-        if sum(p['character_count'] for p in pages)>self.library.config.document_limits.characters:
-            raise Problem('RESOURCE_LIMIT','The whole document exceeds its character limit')
-        result=assemble(source['id'],pages,total_pages=count)
-        self.context.emit('Validating source',{'lessons_found':len(result['lessons'])})
-        complete_report=self.library.objects.put_json(result)
-        summary={'status':result['status'],'full_report':complete_report,'unresolved_sections':result['unresolved_sections'],
-                 'lessons':[{'lesson':{'lesson':b['lesson']['lesson']},'coverage':{'status':b['coverage']['status'],'issues':b['coverage']['issues']}} for b in result['lessons']]}
-        report_ref=self.library.objects.put_json(summary);published=[]
-        for bundle in result['lessons']:
-            if bundle['coverage']['status']!='VERIFIED':continue
-            self.context.emit('Building lesson library',{'lessons_done':len(published),'lessons_found':len(result['lessons'])})
-            published.append(self.library.add_lesson(bundle,source['id'],extra_binding={'page_evidence':chunks},fence=(self.task_id,self.fence)))
-        issues=result['unresolved_sections'] or len(published)!=len(result['lessons']) or not published
-        status=('PARTIALLY_IMPORTED' if published else 'NEEDS_ATTENTION') if issues else 'READY'
-        with self.db.transaction() as c:
-            require_fence(c,self.task_id,self.fence)
-            c.execute('UPDATE sources SET status=?,pages=?,report=? WHERE id=?',(status,count,report_ref,source['id']))
-            self.db.event(c,'library',{'source_id':source['id'],'status':status,'lessons':published},self.task_id)
-            prefs=json.loads(one(c,'SELECT value FROM preferences WHERE singleton=1')['value'])
-            if prefs['background_prepare']:
-                for item in published:
-                    lesson=one(c,'SELECT * FROM lessons WHERE id=?',(item['lesson_id'],))
-                    if lesson['frozen_ref'] or one(c,"SELECT id FROM tasks WHERE kind='prepare' AND lesson_id=? AND status NOT IN ('FAILED','CANCELLED')",(lesson['id'],)):continue
-                    task=task_record('prepare',{'lesson_content_id':lesson['id'],'lesson_json':lesson['lesson_json']},
-                                     lesson_id=lesson['id'],family_id=lesson['family_id'],priority=40)
-                    insert_task(c,task)
-        self.context.emit('Partially imported' if issues and published else 'Needs attention' if issues else 'Ready',{'lessons_imported':len(published)})
-        return 'NEEDS_ATTENTION' if issues else 'COMPLETED'
+        from .importing import import_document
+        return import_document(self)
 
     def prepare(self):
         row,original=self.library.lesson(self.task['lesson_id'])
@@ -152,7 +111,7 @@ class Job:
             reference=json.loads(row['frozen_ref'])
             frozen,store=self.library.frozen(reference)
             bound=Lesson.model_validate(self.library.objects.read_json(reference.get('lesson_object',row['lesson_json'])))
-            if identities(bound)['lesson_content_id']!=self.task['lesson_id']:raise Problem('CONTENT_HASH_CONFLICT','Frozen content binding differs')
+            if not content_matches(bound,self.task['lesson_id']):raise Problem('CONTENT_HASH_CONFLICT','Frozen content binding differs')
             verify_evidence(store,bound,frozen)
             self.save(frozen_ref=reference);return reference
         lesson=Lesson.model_validate(self.library.objects.read_json(self.inputs['lesson_json']))
@@ -189,7 +148,7 @@ class Job:
             return 'QUEUED'
         frozen,store=self.library.frozen(reference)
         lesson=Lesson.model_validate(self.library.objects.read_json(reference.get('lesson_object',self.inputs['lesson_json'])))
-        if identities(lesson)['lesson_content_id']!=self.task['lesson_id']:raise Problem('TASK_INPUT_CHANGED','Queued content identity changed')
+        if not content_matches(lesson,self.task['lesson_id']):raise Problem('TASK_INPUT_CHANGED','Queued content identity changed')
         verify_evidence(store,lesson,frozen)
         template=self.library.objects.path(self.inputs['template_ref'])
         if sha256(template)!=self.inputs['template_sha256']:raise Problem('TASK_INPUT_CHANGED','Queued template changed')
@@ -225,9 +184,11 @@ class Job:
                 c.execute('INSERT OR IGNORE INTO representation_rejections VALUES(?,?,?,?,?)',
                     (self.task['family_id'],delivery,digest(item['layout']),encode(item['layout']),item['reason']))
         prefs=self.library.preferences();policy=self.library.config.resources
+        reservation=self.db.one('SELECT resources FROM reservations WHERE task_id=? AND fence=?',(self.task_id,self.fence))
+        admitted=json.loads(reservation['resources'])['cpu'] if reservation else min(prefs['threads_per_search'],policy.cpu_threads)
         try:
             layout,evidence=next_structure(lesson,frozen,profile,history,rejected,seconds=policy.search_seconds,
-                threads=min(prefs['threads_per_search'],policy.cpu_threads),seed=37+self.task['attempt'],
+                threads=admitted,seed=37+self.task['attempt'],
                 cancel=self.context.cancelled,rejected=reject,stage=self.context.emit)
         except Problem as exc:
             if exc.code not in ('CANCELLED','PAUSED_BY_USER','ATTEMPT_EXPIRED'):

@@ -188,15 +188,26 @@ def create_app(config=None):
         return library.results(lesson_id,offset,limit)
 
     @app.get('/api/sources')
-    def sources(offset:int=Query(0,ge=0)):
-        return {'items':library.db.all('SELECT id,name,bytes,status,pages,report IS NOT NULL AS report FROM sources ORDER BY created DESC LIMIT 100 OFFSET ?',(offset,))}
+    def sources(offset:int=Query(0,ge=0),history:bool=False):
+        where='' if history else 'WHERE notice_dismissed_at IS NULL'
+        return {'items':library.db.all('SELECT id,name,bytes,status,pages,notice_dismissed_at,parser_version,report IS NOT NULL AS report FROM sources '+where+' ORDER BY created DESC LIMIT 100 OFFSET ?',(offset,))}
+
+    @app.post('/api/sources/{source_id}/{action}')
+    def source_notice(source_id:str,action:str):
+        if action not in ('dismiss','restore-notice'):raise Problem('INPUT_INVALID','Unknown notice action')
+        return library.dismiss_source(source_id,restore=action=='restore-notice')
 
     @app.get('/api/sources/{source_id}/report')
-    def source_report(source_id:str):
+    def source_report(source_id:str,task_id:str|None=None):
         source=library.db.one('SELECT report FROM sources WHERE id=?',(source_id,))
+        if task_id:
+            source=library.db.one('SELECT report FROM source_attempts WHERE source_id=? AND task_id=?',(source_id,task_id))
         if not source or not source['report']:raise Problem('NOT_FOUND','Import details are not available yet')
         report=library.objects.read_json(source['report'])
-        return {'issues':report.get('unresolved_sections',[])[:100],'lessons':[{'number':r.get('lesson',{}).get('lesson'),
+        return {'status':report.get('status'),'parser_version':report.get('parser_version'),'timings':report.get('timings'),
+                'recovery_errors':[{'code':a['code'],'page':a.get('page')} for a in report.get('recovery_attempts',[]) if a.get('code')],
+                'attempts':library.db.all('SELECT task_id,parser_version,created,report IS NOT NULL AS report FROM source_attempts WHERE source_id=? ORDER BY created DESC',(source_id,)),
+                'issues':report.get('unresolved_sections',[])[:100],'lessons':[{'number':r.get('lesson',{}).get('lesson'),
                 'status':r.get('coverage',{}).get('status'),'errors':r.get('coverage',{}).get('issues',[])} for r in report.get('lessons',[])][:256]}
 
     @app.get('/api/lessons/{lesson_id}/transcript')
@@ -255,19 +266,26 @@ def create_app(config=None):
         return enqueue('verify',artifact['lesson_id'],{'artifact_id':artifact_id})
 
     @app.get('/api/tasks')
-    def tasks(offset:int=Query(0,ge=0),limit:int=Query(50,ge=1,le=100)):return library.list_tasks(offset,limit)
+    def tasks(offset:int=Query(0,ge=0),limit:int=Query(50,ge=1,le=100),history:bool=False):return library.list_tasks(offset,limit,history=history)
+
+    @app.post('/api/tasks/dismiss-completed')
+    def dismiss_completed():return library.dismiss_tasks()
 
     @app.post('/api/tasks/{task_id}/{action}')
-    def task_control(task_id:str,action:str):return library.control(task_id,action)
+    def task_control(task_id:str,action:str):
+        if action in ('dismiss','restore-activity'):return library.dismiss_tasks(task_id,restore=action=='restore-activity')
+        return library.control(task_id,action)
 
     @app.get('/api/resources')
     def resources():
+        from .resources import enforcement
         row=library.db.one('SELECT value FROM telemetry WHERE singleton=1');sample=json.loads(row['value']) if row else None
         if sample:
             sample={**sample,'host_cpu_percent':sample.get('cpu_percent'),'app_cpu_percent':sample.get('application_cpu_percent'),
                     'memory_available_bytes':sample.get('memory',{}).get('MemAvailable'),'app_rss_bytes':sample.get('application',{}).get('cgroup_memory_bytes') if sample.get('application',{}).get('cgroup_memory_bytes') is not None else sample.get('application',{}).get('rss_upper_bound_bytes'),
                     'app_memory_scope':'Application cgroup, including its file cache; excludes the shared model service' if sample.get('application',{}).get('cgroup_memory_bytes') is not None else 'Process RSS sum; shared pages may be counted more than once',
-                    'psi':sample.get('pressure'),'gpu':{**(sample.get('gpu') or {}),'utilization':(sample.get('gpu') or {}).get('utilization_percent')}}
+                    'psi':sample.get('pressure'),'enforcement':enforcement(sample.get('cgroup')),
+                    'gpu':{**(sample.get('gpu') or {}),'utilization':(sample.get('gpu') or {}).get('utilization_percent')}}
         waiting=library.db.one("SELECT count(*) n FROM tasks WHERE status IN ('QUEUED','WAITING_FOR_RESOURCES','PAUSED_FOR_RESOURCES','RETRY_WAIT','PARTIALLY_COMPLETED')")['n']
         latest=library.db.one("SELECT detail FROM tasks WHERE status='WAITING_FOR_RESOURCES' ORDER BY updated DESC LIMIT 1")
         reason=json.loads(latest['detail']).get('reason') if latest and latest['detail'] else None

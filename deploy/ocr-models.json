@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "source": "https://huggingface.co/docling-project/docling-layout-heron/resolve/8f39ad3c0b4c58e9c2d2c84a38465abf757272d8/config.json",
+      "sha256": "fdea30805ce2f5666b147fca941dcdd27ad468e27d6ed21902207d3da056a97d",
+      "bytes": 3268,
+      "model": "docling-project/docling-layout-heron",
+      "revision": "8f39ad3c0b4c58e9c2d2c84a38465abf757272d8",
+      "license": "Apache-2.0",
+      "relative_path": "docling/docling-project--docling-layout-heron/config.json"
+    },
+    {
+      "source": "https://huggingface.co/docling-project/docling-layout-heron/resolve/8f39ad3c0b4c58e9c2d2c84a38465abf757272d8/preprocessor_config.json",
+      "sha256": "cd38cd59999e7a95d68e487fbe5132df3d4e5c32a0836add57e6126ba0c4eaf1",
+      "bytes": 444,
+      "model": "docling-project/docling-layout-heron",
+      "revision": "8f39ad3c0b4c58e9c2d2c84a38465abf757272d8",
+      "license": "Apache-2.0",
+      "relative_path": "docling/docling-project--docling-layout-heron/preprocessor_config.json"
+    },
+    {
+      "source": "https://huggingface.co/docling-project/docling-layout-heron/resolve/8f39ad3c0b4c58e9c2d2c84a38465abf757272d8/model.safetensors",
+      "sha256": "00333a43451945aaf89db8ca9c0a17e75d1537c17db60fdb91aa95f4c7929e0c",
+      "bytes": 171658996,
+      "model": "docling-project/docling-layout-heron",
+      "revision": "8f39ad3c0b4c58e9c2d2c84a38465abf757272d8",
+      "license": "Apache-2.0",
+      "relative_path": "docling/docling-project--docling-layout-heron/model.safetensors"
+    },
+    {
+      "source": "https://huggingface.co/docling-project/docling-layout-heron/resolve/8f39ad3c0b4c58e9c2d2c84a38465abf757272d8/README.md",
+      "sha256": "175700839bc7808eac6af1d0c23e4f483606ab2276fe01122f4093e61a1a65b6",
+      "bytes": 3219,
+      "model": "docling-project/docling-layout-heron",
+      "revision": "8f39ad3c0b4c58e9c2d2c84a38465abf757272d8",
+      "license": "Apache-2.0",
+      "relative_path": "docling/docling-project--docling-layout-heron/README.md"
+    },
+    {
+      "source": "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.2/onnx/PP-OCRv4/det/ch_PP-OCRv4_det_mobile.onnx",
+      "sha256": "d2a7720d45a54257208b1e13e36a8479894cb74155a5efe29462512d42f49da9",
+      "bytes": 4745517,
+      "model": "ch_PP-OCRv4_det_mobile",
+      "revision": "RapidOCR-v3.9.2/PP-OCRv4",
+      "license": "Apache-2.0",
+      "role": "det",
+      "relative_path": "docling/RapidOcr/ch_PP-OCRv4_det_mobile.onnx"
+    },
+    {
+      "source": "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.2/onnx/PP-OCRv4/cls/ch_ppocr_mobile_v2.0_cls_mobile.onnx",
+      "sha256": "e47acedf663230f8863ff1ab0e64dd2d82b838fceb5957146dab185a89d6215c",
+      "bytes": 585532,
+      "model": "ch_ppocr_mobile_v2.0_cls_mobile",
+      "revision": "RapidOCR-v3.9.2/PP-OCRv4",
+      "license": "Apache-2.0",
+      "role": "cls",
+      "relative_path": "docling/RapidOcr/ch_ppocr_mobile_v2.0_cls_mobile.onnx"
+    },
+    {
+      "source": "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.2/onnx/PP-OCRv4/rec/en_PP-OCRv4_rec_mobile.onnx",
+      "sha256": "e8770c967605983d1570cdf5352041dfb68fa0c21664f49f47b155abd3e0e318",
+      "bytes": 7653044,
+      "model": "en_PP-OCRv4_rec_mobile",
+      "revision": "RapidOCR-v3.9.2/PP-OCRv4",
+      "license": "Apache-2.0",
+      "role": "rec",
+      "relative_path": "docling/RapidOcr/en_PP-OCRv4_rec_mobile.onnx"
+    }
+  ]
+}

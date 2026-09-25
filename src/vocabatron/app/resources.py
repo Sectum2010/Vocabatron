@@ -2,6 +2,7 @@
 from __future__ import annotations
 from collections import deque
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -50,11 +51,33 @@ def cgroup_metrics():
     except (OSError,StopIteration):return None
 
 
+def enforcement(cgroup):
+    """Report the strictest live parent/worker limit, not a template value."""
+    if not cgroup or not cgroup.get('dedicated'):return None
+    groups=[cgroup]
+    if cgroup.get('application_slice'):groups.append(cgroup['application_slice'])
+    result={}
+    for key in ('memory.high','memory.max','memory.swap.max'):
+        values=[int(g[key]) for g in groups if str(g.get(key,'')).isdigit()]
+        result[key]=min(values) if values else None
+    quotas=[];known=True
+    for group in groups:
+        parts=(group.get('cpu.max') or '').split()
+        if len(parts)!=2:known=False;continue
+        try:
+            if int(parts[1])<=0:known=False
+            elif parts[0]!='max':quotas.append(int(parts[0])/int(parts[1]))
+        except ValueError:known=False
+    result.update(cpu_quota_cores=min(quotas) if quotas else None,cpu_quota_known=known,
+        io_limits=[g.get('io.max') for g in groups],memory_scope='Minimum of the live worker and application slice limits')
+    return result
+
+
 class Telemetry:
     def __init__(self, disk_root, owned_pids=None, *, model_probe=True):
         self.disk_root=Path(disk_root);self.owned_pids=owned_pids or (lambda: [os.getpid()])
         self.model_probe=model_probe;self.previous=None;self.previous_own=None
-        self.previous_cgroup=None
+        self.previous_cgroup=None;self.previous_throttle=None
         self.gpu=None;self.gpu_at=0;self.ollama=None;self.ollama_at=0
         self.ring=deque(maxlen=120)
 
@@ -93,11 +116,16 @@ class Telemetry:
             elapsed=clock-self.previous_own[0]
             own_cpu=max(0,(own_seconds-self.previous_own[1])/elapsed/(os.cpu_count() or 1)*100)
         self.previous_own=(clock,own_seconds)
-        group_memory=None
+        group_memory=None;throttle=None
         if cg and cg.get('application_slice'):
             group=cg['application_slice']
             try:
-                seconds=int(dict(line.split() for line in group['cpu.stat'].splitlines())['usage_usec'])/1e6
+                statistics=dict(line.split() for line in group['cpu.stat'].splitlines())
+                seconds=int(statistics['usage_usec'])/1e6
+                usec=int(statistics.get('throttled_usec',0))
+                throttle={'nr_throttled':int(statistics.get('nr_throttled',0)),'throttled_usec':usec,
+                          'recent_throttled_percent':None if self.previous_throttle is None else max(0,(usec-self.previous_throttle[1])/(clock-self.previous_throttle[0])/10000)}
+                self.previous_throttle=(clock,usec)
                 if self.previous_cgroup:
                     own_cpu=max(0,(seconds-self.previous_cgroup[1])/(clock-self.previous_cgroup[0])/(os.cpu_count() or 1)*100)
                 self.previous_cgroup=(clock,seconds)
@@ -144,7 +172,7 @@ class Telemetry:
                              'other_models_loaded':any(m.get('name')!='gemma4:31b' for m in models),'sampled_at':now}
             except (OSError,ValueError):self.ollama={'status':'Unavailable','sampled_at':now}
         disk=shutil.disk_usage(self.disk_root)
-        result={'sampled_at':now,'cpu_percent':cpu,'external_cpu_percent':None if cpu is None else max(0,cpu-own_cpu),
+        result={'sampled_at':now,'logical_cpus':os.cpu_count(),'cpu_percent':cpu,'external_cpu_percent':None if cpu is None else max(0,cpu-own_cpu),
                 'application_cpu_percent':own_cpu,'memory':memory,'disk_free_bytes':disk.free,
                 'pressure':{key:pressure('/proc/pressure/'+key) for key in ('cpu','memory','io')},
                 'application':{'rss_upper_bound_bytes':own_rss,'rss_max_process_bytes':max_rss,'cgroup_memory_bytes':group_memory,
@@ -152,6 +180,9 @@ class Telemetry:
                                'threads':threads,'processes':len(processes)},'cgroup':cg,'gpu':self.gpu,
                 'ollama':self.ollama,'external_model_connections':external_connections}
         self.ring.append({k:result[k] for k in ('sampled_at','cpu_percent','external_cpu_percent')})
+        recent=[s['external_cpu_percent'] for s in self.ring if now-s['sampled_at']<=5 and s['external_cpu_percent'] is not None]
+        result['external_cpu_recent_percent']=sum(recent)/len(recent) if recent else None
+        result['application_quota_throttling']=throttle
         return result
 
 
@@ -161,7 +192,7 @@ def estimate(phase, *, words=(), pages=1, history=0, threads=1, model_loaded=Fal
     features={'words':len(words),'placements':placements,'matching_letter_pairs':shared,'pages':pages,'history':history,'threads':threads}
     if phase=='search':memory=int(384*1024**2+placements*170_000+shared*20_000+history*(16*1024+len(words)*2048)+threads*128*1024**2)
     elif phase=='inference':memory=256*1024**2
-    elif phase=='import':memory=min(3*GIB,512*1024**2+pages*12*1024**2)
+    elif phase=='import':memory=3*GIB+pages*16*1024**2  # Bounded OCR tree plus retained document evidence.
     elif phase=='verify':memory=768*1024**2
     else:memory=256*1024**2
     extra=(2*GIB if model_loaded else 26*GIB) if phase=='inference' else 0
@@ -171,23 +202,37 @@ def estimate(phase, *, words=(), pages=1, history=0, threads=1, model_loaded=Fal
             'features':features,'confidence':'conservative upper bound; not a completion-time prediction'}
 
 
+def spare_threads(snapshot,policy):
+    if not snapshot or time.time()-snapshot.get('sampled_at',0)>policy.stale_seconds:return 0
+    external=snapshot.get('external_cpu_percent')
+    if external is None:return 0
+    external=max(external,snapshot.get('external_cpu_recent_percent') or external)
+    cores=snapshot.get('logical_cpus') or os.cpu_count() or 1
+    return max(0,min(policy.cpu_threads,cores-math.ceil(cores*external/100)-policy.reserved_cpu_cores))
+
+
 def pressure_reason(snapshot, policy, *, running=False, inference=False, now=None,cpu_only=False):
     now=now or time.time()
-    if not snapshot or now-snapshot.get('sampled_at',0)>policy.stale_seconds:return 'Resource telemetry is stale'
+    if not snapshot or now-snapshot.get('sampled_at',0)>policy.stale_seconds:return None if running else 'Resource telemetry is stale'
     cpu=snapshot.get('external_cpu_percent')
-    if cpu is None:return 'Collecting a stable resource sample'
+    if cpu is None:return None if running else 'Collecting a stable resource sample'
+    if snapshot['memory'].get('MemAvailable',0)<policy.host_memory_reserve_bytes:return 'Keeping memory available for other applications'
+    memory_pressure=(snapshot.get('pressure',{}).get('memory') or {}).get('some',{}).get('avg10')
+    if memory_pressure is not None and memory_pressure>policy.memory_psi_percent:return 'Host memory pressure is elevated'
+    if snapshot.get('disk_free_bytes',0)<policy.disk_reserve_bytes:return 'Keeping the disk safety reserve'
     threshold=policy.external_cpu_stop_percent if running else policy.external_cpu_start_percent
     if cpu>threshold:return 'Other applications are using the CPU'
     for kind,limit in (('cpu',policy.cpu_psi_percent),('memory',policy.memory_psi_percent),('io',policy.io_psi_percent)):
         data=snapshot.get('pressure',{}).get(kind)
-        if not data or 'some' not in data:return f'{kind.upper()} pressure telemetry is unavailable'
+        if not data or 'some' not in data:
+            if running:continue
+            return f'{kind.upper()} pressure telemetry is unavailable'
         # Host CPU PSI includes our own idle-priority/affinity-limited workers.
         # It cannot be labelled external contention while ample CPU capacity is
         # free. Memory and I/O pressure always remain independent stop signals.
         if kind=='cpu' and cpu<policy.cpu_pressure_min_external_percent:continue
-        if data['some']['avg10']>limit:return f'Other workloads are causing {kind.upper()} pressure'
-    if snapshot['memory'].get('MemAvailable',0)<policy.host_memory_reserve_bytes:return 'Keeping memory available for other applications'
-    if snapshot.get('disk_free_bytes',0)<policy.disk_reserve_bytes:return 'Keeping the disk safety reserve'
+        if kind in ('cpu','io') and running:continue
+        if data['some']['avg10']>limit:return f'Host {kind.upper()} pressure is elevated; waiting to start the next step'
     gpu=snapshot.get('gpu') or {}
     # A resident GPU context is not evidence that CPU-only work would contend.
     # Inference remains blocked by that context even while it is idle. CPU work
@@ -225,7 +270,7 @@ class Admission:
         if request['gpu'] and (self.gpu_idle_since is None or now-self.gpu_idle_since<self.policy.gpu_idle_window_seconds):return 'Waiting for a safe inference window'
         if rows(c,'SELECT id FROM holds WHERE until>?',(now,)):return 'An external workload has reserved this resource window'
         held=[json.loads(r['resources']) for r in rows(c,'SELECT resources FROM reservations')]
-        if sum(r['cpu'] for r in held)+request['cpu']>self.policy.cpu_threads:return 'The application CPU budget is reserved'
+        if sum(r['cpu'] for r in held)+request['cpu']>spare_threads(snapshot,self.policy):return 'Waiting for spare CPU cores after the host reserve'
         if sum(r['documents'] for r in held)+request['documents']>self.policy.document_slots:return 'The document worker slot is reserved'
         if sum(r['gpu'] for r in held)+request['gpu']>1:return 'The local inference slot is reserved'
         if sum(r['memory_bytes'] for r in held)+request['memory_bytes']>self.policy.memory_max_bytes:return 'The application memory budget is reserved'

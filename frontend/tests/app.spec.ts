@@ -20,6 +20,14 @@ test('library, shared preferences, upload and durable task controls',async({page
   await task.getByRole('button',{name:'Resume',exact:true}).click();
   page.once('dialog',dialog=>dialog.accept());await task.getByRole('button',{name:'Cancel',exact:true}).click();
   await expect(task.getByRole('heading',{name:'Cancelled',exact:true})).toBeVisible();
+  const taskCode=await task.locator('code').innerText();
+  await task.getByRole('button',{name:'Dismiss activity',exact:true}).click();
+  await page.reload();await page.getByRole('button',{name:'Activity',exact:true}).click();
+  await expect(page.locator('.task').filter({hasText:taskCode})).toHaveCount(0);
+  await page.getByRole('button',{name:'History',exact:true}).click();
+  await page.locator('.task').filter({hasText:taskCode}).getByRole('button',{name:'Restore activity',exact:true}).click();
+  await page.getByRole('button',{name:'Active view',exact:true}).click();
+  await expect(page.locator('.task').filter({hasText:taskCode})).toBeVisible();
   await page.screenshot({path:info.outputPath('activity.png'),fullPage:true});
   await page.getByRole('button',{name:'Settings',exact:true}).click();
   const current=await page.getByRole('spinbutton',{name:'Default variants per lesson'}).inputValue();
@@ -40,6 +48,20 @@ test('library, shared preferences, upload and durable task controls',async({page
   await page.getByLabel('Upload PDF documents').setInputFiles(fixture.source);
   await expect(page.getByRole('status').filter({hasText:'already in your library'})).toBeVisible();
   expect(external).toEqual([]);expect(errors).toEqual([]);
+});
+
+test('import notices can be dismissed and recovered without removing lessons',async({page})=>{
+  await page.goto('./');
+  const notice=page.locator('.source-row').filter({hasText:'Unresolved invented.pdf'});
+  await page.getByText(/Import notices ·/).click();
+  await expect(notice).toBeVisible();
+  await notice.getByRole('button',{name:'Dismiss import notice',exact:true}).click();
+  await page.reload();await expect(notice).toHaveCount(0);
+  await expect(page.getByRole('checkbox',{name:/Select Lesson 3/})).toBeVisible();
+  await page.getByRole('button',{name:'Import history',exact:true}).click();
+  await notice.getByRole('button',{name:'Restore notice',exact:true}).click();
+  await page.getByRole('button',{name:'Hide import history',exact:true}).click();
+  await page.getByText(/Import notices ·/).click();await expect(notice).toBeVisible();
 });
 
 test('PDF rendering, keyboard, source text and restore',async({page},info)=>{

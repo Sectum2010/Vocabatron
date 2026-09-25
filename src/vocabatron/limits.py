@@ -14,7 +14,7 @@ class Limits(BaseModel):
     cpu_seconds: int=Field(default=120,ge=1,le=600)
     wall_seconds: float=Field(default=180,gt=0,le=900)
     address_bytes: int=Field(default=4*1024**3,ge=64*1024**2,le=16*1024**3)
+    rss_bytes: int=Field(default=2560*1024**2,ge=64*1024**2,le=12*1024**3)
     fds: int=Field(default=64,ge=16,le=128)
     file_bytes: int=Field(default=128*1024**2,ge=1024,le=512*1024**2)
     temporary_bytes: int=Field(default=256*1024**2,ge=1024,le=1024**3)
-

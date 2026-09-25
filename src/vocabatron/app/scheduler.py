@@ -17,7 +17,7 @@ from ..execution import owner_identity
 from ..storage import private_mkdir
 from .database import one,rows,encode
 from .library import Library
-from .resources import Telemetry,Admission,estimate,pressure_reason,idle_priority
+from .resources import Telemetry,Admission,estimate,pressure_reason,idle_priority,spare_threads
 
 CLAIMABLE=('QUEUED','WAITING_FOR_RESOURCES','PAUSED_FOR_RESOURCES','RETRY_WAIT','PARTIALLY_COMPLETED','INTERRUPTED')
 
@@ -80,7 +80,7 @@ class Scheduler:
             abandoned=self.db.one("SELECT a.id FROM artifacts a JOIN tasks t ON t.id=a.task_id WHERE a.lesson_id=? AND a.delivery_id=? AND a.state!='AVAILABLE' AND t.status IN ('CANCELLED','FAILED','NEEDS_ATTENTION') LIMIT 1",(task['lesson_id'],delivery))
             if abandoned:return estimate('verify')
         prefs=self.library.preferences()
-        predicted=estimate('search',words=lesson.words,history=count,threads=min(prefs['threads_per_search'],self.config.resources.cpu_threads))
+        predicted=estimate('search',words=lesson.words,history=count,threads=max(1,min(prefs['threads_per_search'],spare_threads(self.last_snapshot,self.config.resources))))
         # A timed-out search still provides a measured memory peak. It must not
         # count as a completed variant, but it can raise the safety estimate.
         samples=self.db.all("SELECT estimate,actual FROM resource_samples WHERE phase='search' ORDER BY id DESC LIMIT 32")
@@ -119,12 +119,16 @@ class Scheduler:
                     continue
                 reason=self.admission.reserve(c,task['id'],fence,request,self.last_snapshot)
                 if reason:
+                    c.execute('UPDATE tasks SET resource_wait_started=COALESCE(resource_wait_started,?) WHERE id=?',(time.time(),task['id']))
                     c.execute('UPDATE tasks SET eligible=? WHERE id=?',(time.time()+3,task['id']))
                     if task['status']!='WAITING_FOR_RESOURCES' or task['detail']!=encode({'reason':reason}):
                         c.execute("UPDATE tasks SET status='WAITING_FOR_RESOURCES',stage='Waiting for system resources',detail=? WHERE id=?",(encode({'reason':reason}),task['id']))
                     continue
                 owner=owner_identity()
-                c.execute("UPDATE tasks SET status='RUNNING',stage='Starting safely',fence=?,owner=?,attempt=attempt+1,lease_until=?,updated=?,error_code=NULL WHERE id=?",(fence,encode(owner),time.time()+15,time.time(),task['id']))
+                now=time.time();wait=task['resource_wait_seconds']+max(0,now-(task['resource_wait_started'] or now))
+                c.execute('UPDATE tasks SET resource_wait_seconds=?,resource_wait_started=NULL,queue_wait_seconds=COALESCE(queue_wait_seconds,?) WHERE id=?',
+                    (wait,max(0,now-task['created']-wait),task['id']))
+                c.execute("UPDATE tasks SET status='RUNNING',stage='Starting safely',fence=?,owner=?,attempt=attempt+1,lease_until=?,updated=?,started_at=COALESCE(started_at,?),yield_requested=NULL,error_code=NULL WHERE id=?",(fence,encode(owner),time.time()+15,time.time(),time.time(),task['id']))
                 if task['family_id']:c.execute('INSERT INTO family_locks VALUES(?,?,?,?)',(task['family_id'],task['id'],fence,encode(owner)))
                 self.db.event(c,'task',{'id':task['id'],'status':'RUNNING'},task['id'])
                 return task['id'],fence,request
@@ -178,7 +182,7 @@ class Scheduler:
                 elif task['intent']=='pause':status='PAUSED_BY_USER'
                 elif active['stop_reason']:
                     status=active['stop_reason'];eligible=time.time()+5
-                elif result.get('status') in ('COMPLETED','PARTIALLY_COMPLETED','QUEUED','EXHAUSTED','NEEDS_ATTENTION'):
+                elif result.get('status') in ('COMPLETED','PARTIALLY_COMPLETED','QUEUED','EXHAUSTED','NEEDS_ATTENTION','FAILED'):
                     status=result['status']
                 elif code in ('UNKNOWN','PAUSED_FOR_RESOURCES','RESOURCE_LIMIT','ATTEMPT_EXPIRED'):
                     status='PAUSED_FOR_RESOURCES' if code in ('PAUSED_FOR_RESOURCES','RESOURCE_LIMIT') else 'QUEUED'
@@ -187,7 +191,9 @@ class Scheduler:
                     retries+=1;status='RETRY_WAIT';eligible=time.time()+min(5*2**retries,60)
                 elif code=='PENDING_VARIANTS':status='RETRY_WAIT';eligible=time.time()+30
                 else:status='FAILED' if code in ('WORKER_FAILED','INTERNAL_ERROR') else 'NEEDS_ATTENTION'
-                detail={'message':result.get('message'),'error_code':code}
+                detail={**(json.loads(task['detail']) if task['detail'] else {}),'message':result.get('message'),'error_code':code}
+                if status=='PAUSED_FOR_RESOURCES':
+                    c.execute('UPDATE tasks SET resource_wait_started=COALESCE(resource_wait_started,?) WHERE id=?',(time.time(),task_id))
                 if status=='EXHAUSTED':detail={'message':f'Requested {task["target_count"]}, generated {task["completed"]}. All remaining variants have been exhausted.' if task['target_type']=='count' else 'All valid variants for this lesson have already been generated. View saved variants.'}
                 c.execute('UPDATE tasks SET status=?,stage=?,detail=?,eligible=?,retries=?,error_code=?,owner=NULL,lease_until=NULL,updated=? WHERE id=?',
                     (status,status.replace('_',' ').capitalize(),encode(detail),eligible,retries,code,time.time(),task_id))
@@ -211,8 +217,16 @@ class Scheduler:
             task=self.db.one('SELECT intent FROM tasks WHERE id=?',(task_id,))
             reason=pressure_reason(self.last_snapshot,self.config.resources,running=True,inference=bool(active['request']['gpu']))
             if task['intent']!='run':self.stop_owned(task_id,'CANCELLED' if task['intent']=='cancel' else 'PAUSED_BY_USER')
-            elif reason or holds:self.stop_owned(task_id,'PAUSED_FOR_RESOURCES')
+            elif holds:self.stop_owned(task_id,'PAUSED_FOR_RESOURCES')
+            elif reason:
+                if 'memory' in reason.lower() or 'disk safety' in reason.lower() or active['request']['gpu']:
+                    self.stop_owned(task_id,'PAUSED_FOR_RESOURCES')
             elif time.monotonic()-active['started']>950:self.stop_owned(task_id,'PAUSED_FOR_RESOURCES')
+            boundary_reason=pressure_reason(self.last_snapshot,self.config.resources,inference=bool(active['request']['gpu']))
+            if not active['request']['gpu'] and active['request']['cpu']>spare_threads(self.last_snapshot,self.config.resources):
+                boundary_reason=boundary_reason or 'Spare CPU capacity decreased'
+            with self.db.transaction() as c:
+                c.execute('UPDATE tasks SET yield_requested=? WHERE id=? AND yield_requested IS NOT ?',(boundary_reason,task_id,boundary_reason))
             if active['stopping_at'] is not None and time.monotonic()-active['stopping_at']>3:
                 if owner_identity(active['process'].pid)==active['owner']:
                     with contextlib.suppress(ProcessLookupError):os.killpg(active['process'].pid,signal.SIGKILL)
@@ -220,6 +234,8 @@ class Scheduler:
         with self.db.transaction() as c:
             snapshot={**self.last_snapshot,'reservations':[json.loads(r['resources']) for r in rows(c,'SELECT resources FROM reservations')],
                       'active_slots':len(self.active),'policy':self.config.resources.model_dump(),
+                      'allowed_cpu_threads':spare_threads(self.last_snapshot,self.config.resources),
+                      'active_cpu_threads':sum(a['request']['cpu'] for a in self.active.values()),
                       'policy_statement':'Other applications always have priority. Shared GPU inference cannot be instantly preempted by client priority.'}
             c.execute('INSERT INTO telemetry VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET value=excluded.value,updated=excluded.updated',(encode(snapshot),time.time()))
             if holds and not self.active:
@@ -238,6 +254,7 @@ class Scheduler:
             fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
             for sig in (signal.SIGINT,signal.SIGTERM):signal.signal(sig,lambda *_:setattr(self,'stop',True))
             self.recover()
+            self.library.retry_parser_upgrades()
             while not self.stop or self.active:
                 if self.stop:
                     for task_id in self.active:self.stop_owned(task_id,'INTERRUPTED')

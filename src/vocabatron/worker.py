@@ -32,10 +32,19 @@ def preflight(path,limits,page_numbers=None):
 def dispatch(op,payload,limits):
     from .domain import FrozenClues,Lesson,Layout,Problem
     for key in ('source','template','output'):
-        if key in payload and Path(payload[key]).is_file():preflight(payload[key],limits,payload.get('page_numbers') if op=='book_pages' else None)
+        if key in payload and Path(payload[key]).is_file():preflight(payload[key],limits,payload.get('page_numbers') if op in ('book_pages','ocr_page','structured_page') else None)
+    if op in ('ocr_page','structured_page'):
+        from .ocr import TesseractBackend
+        from .vocabulary import events
+        if op=='structured_page':
+            from .structured_ocr import DoclingBackend
+            page=DoclingBackend().extract(Path(payload['source']),payload['page_numbers'][0],limits)
+        else:page=TesseractBackend().extract(Path(payload['source']),payload['page_numbers'][0],limits,variant=payload.get('variant',0))
+        page['events']=events(page)
+        return page
     if op=='book_pages':
         from .app.book import extract_pages
-        return extract_pages(Path(payload['source']),payload['page_numbers'],limits=limits)
+        return extract_pages(Path(payload['source']),payload['page_numbers'],limits=limits,use_tables=payload.get('use_tables',True))
     if op=='extract':
         from .ingest import extract_local
         return extract_local(Path(payload['source']),payload['lesson'],limits=limits)
@@ -70,8 +79,11 @@ def main(job,limits):
         response={'ok':True,'result':result}
     except (MemoryError,OverflowError):response={'ok':False,'code':'RESOURCE_LIMIT'}
     except Problem as exc:response={'ok':False,'code':exc.code,'error_details':exc.details}
-    except Exception:response={'ok':False,'code':'WORKER_FAILED'}
+    except Exception as exc:
+        import traceback
+        response={'ok':False,'code':'WORKER_FAILED','error_details':{'type':type(exc).__name__,'trace':traceback.format_exc(limit=12)}}
     response['metrics']={'peak_rss_kib':resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        'network_isolation':os.environ.get('VOCABATRON_DOCUMENT_NETWORK','local-model-http-only'),
         'rss_scope':'single document or HTTP worker process, Linux ru_maxrss KiB','configured_native_threads':1,'observed_threads':len(list(Path('/proc/self/task').iterdir()))}
     encoded=json.dumps(response,ensure_ascii=False,allow_nan=False).encode()
     if len(encoded)>limits['ipc_bytes']:encoded=b'{"ok":false,"code":"RESOURCE_LIMIT"}'

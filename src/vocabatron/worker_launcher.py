@@ -9,6 +9,11 @@ import subprocess
 import sys
 import time
 
+# Executing this file by absolute path puts the package directory itself first
+# on sys.path. Do not let vocabatron/requests.py shadow the installed requests
+# package used by offline document libraries.
+sys.path=[p for p in sys.path if Path(p).resolve()!=Path(__file__).resolve().parent]
+
 
 def main():
     job=Path(sys.argv[1]);limits=json.loads(sys.argv[2]);os.umask(0o077)
@@ -32,6 +37,10 @@ def main():
     if '--worker' in sys.argv:
         # The guardian owns cancellation; default TERM kills this worker promptly.
         signal.signal(signal.SIGTERM,signal.SIG_DFL)
+        request=json.loads((job/'request.json').read_bytes())
+        if request['operation']!='ollama':
+            from vocabatron.offline import deny_network
+            os.environ['VOCABATRON_DOCUMENT_NETWORK']=deny_network()
         from vocabatron.worker import main as worker
         return worker(job,limits)
     process=subprocess.Popen([sys.executable,__file__,str(job),json.dumps(limits),'--worker',str(os.getpid())],

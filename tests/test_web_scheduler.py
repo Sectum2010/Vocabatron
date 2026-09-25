@@ -59,6 +59,12 @@ def test_real_owned_worker_yields_and_fresh_scheduler_waits(library,monkeypatch)
             'stop_reason':None,'stopping_at':None,'started':time.monotonic()}
         busy=quiet_sample();busy['external_cpu_percent']=90
         monkeypatch.setattr(scheduler.telemetry,'sample',lambda:busy)
+        scheduler.tick()
+        assert child.poll() is None
+        assert library.db.one('SELECT yield_requested FROM tasks WHERE id=?',(tid,))['yield_requested']
+        # CPU contention checkpoints the next bounded unit. Memory pressure
+        # promptly releases this owned process; no external process is touched.
+        busy['memory']['MemAvailable']=1024**3
         started=time.monotonic();scheduler.tick();child.wait(timeout=3)
         scheduler.tick();latency=time.monotonic()-started
         assert latency<3
